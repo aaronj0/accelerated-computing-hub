@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-// CUB's device histogram behind a host function: an existing C++ library called from the session.
-//
-// samples_ptr points at n int32 bin indices in [0, k_bins) on the device, hist_ptr at
-// k_bins int32 counters, which the call overwrites. The pointers and the stream arrive as
-// integers, the way CuPy exposes them. CUB sizes its scratch on a first dry run; the
-// buffer is kept across calls, so a call after the first is the library's kernels only.
+// CUB's device histogram behind a host function: n int32 samples in [0, k_bins) at samples_ptr counted into
+// k_bins int32 counters at hist_ptr, the pointers and the stream passed as integers the way CuPy exposes them.
 
 #include <cstdio>
 #include <cstdlib>
@@ -24,11 +20,11 @@
 void cub_histogram(unsigned long long samples_ptr, unsigned long long hist_ptr, long long n, int k_bins,
                    unsigned long long stream)
 {
-    static void* scratch = nullptr;
+    static void* scratch = nullptr;       // sized by CUB on the first call and kept, so later calls launch only the kernels
     static size_t scratch_bytes = 0;
     const int* samples = reinterpret_cast<const int*>(samples_ptr);
     int* hist = reinterpret_cast<int*>(hist_ptr);
-    cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
+    const cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
     size_t needed = 0;
     CUDA_CHECK(cub::DeviceHistogram::HistogramEven(nullptr, needed, samples, hist, k_bins + 1, 0, k_bins, n, s));
     if (needed > scratch_bytes) {

@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-// Euler characteristic curve of a binned periodic field: one thread per voxel.
-//
-// q is an int32 N^3 field of bin indices in [0, K_BINS), C order with k fastest.
-// Voxel (i, j, k) owns eight cells of the periodic cubical complex: its vertex,
-// the +x/+y/+z edges, the +xy/+xz/+yz faces and the +xyz cube. A cell is born at
-// the minimum bin over its corners. Each thread adds (-1)^dim at the birth bin
-// of its eight cells into a shared-memory histogram; after the barrier each
-// block flushes its K_BINS counters into the global histogram with atomicAdd.
-// The signed histogram summed from the top is chi at every bin edge.
+// Signed histogram of cell births on a binned periodic field, one thread per voxel.
+// q is an int32 n^3 field of bin indices in [0, K_BINS), C order with k fastest; each thread adds
+// (-1)^dim at the birth bin of its eight cells into a shared histogram, which the block then flushes.
 
 #include <cuda_runtime.h>
 
@@ -20,10 +14,10 @@ __global__ void ecc_hist_kernel(const int* __restrict__ q, int* __restrict__ his
     __shared__ int sh[K_BINS];
     for (int b = threadIdx.x; b < K_BINS; b += blockDim.x) sh[b] = 0;
     __syncthreads();
-    const long long t  = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    const long long nn = (long long)n * n;
+    const long long t  = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const long long nn = static_cast<long long>(n) * n;
     if (t < nn * n) {
-        const int k = (int)(t % n), j = (int)((t / n) % n), i = (int)(t / nn);
+        const int k = static_cast<int>(t % n), j = static_cast<int>((t / n) % n), i = static_cast<int>(t / nn);
         const int i1 = wrap1(i, n), j1 = wrap1(j, n), k1 = wrap1(k, n);
         // BEGIN BODY
         const int v000 = q[i * nn + j * n + k],   v100 = q[i1 * nn + j * n + k];

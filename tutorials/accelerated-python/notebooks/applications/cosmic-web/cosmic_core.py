@@ -1,51 +1,33 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Euler characteristic curve of a periodic density field: reference, oracle and harness.
+"""Euler characteristic curve of a periodic density field: the reference, the checks and the harness.
 
-The field is a smoothed density contrast on a periodic N³ grid, standardised to
-ν = δ/σ. Thresholding at ν gives the superlevel set {ν ≥ ν₀}; its Euler
-characteristic χ counts blobs − tunnels + cavities, and χ tracked against ν is
-the genus curve of Gott, Melott & Dickinson (1986), g = −χ/V.
-
-Cubical complex (V-construction). Grid points are vertices and voxel (i, j, k)
-owns eight cells: its vertex, the +x/+y/+z edges, the +xy/+xz/+yz faces and the
-+xyz cube. A cell belongs to the superlevel set when every corner does, so its
-birth is the minimum over its corners and
-
-    χ(ν) = Σ_cells (−1)^dim [birth ≥ ν].
-
-Binning. ν is binned once, on the device, into K integer bins over [NU_LO, NU_HI):
-
-    idx = clip(floor((ν − NU_LO) · K / (NU_HI − NU_LO)), 0, K − 1).
-
-Every tool consumes idx, never ν. Binning is monotone, so the minimum over
-corners commutes with it and each tool's signed histogram of births is bit-exact
-against `ecc_hist_cupy`. χ at bin edge b is the histogram summed from the top.
-
-Gaussian expectation (Hamilton, Gott & Weinberg 1986, ApJ 309, 1; Adler &
-Taylor 2007; Pranav et al. 2019, MNRAS 485, 4167, eq. 54):
-
-    E[χ(ν)] / V = λ³ / (2π)² · (ν² − 1) · exp(−ν²/2),    λ² = ⟨|∇f|²⟩ / (3 ⟨f²⟩).
-
-`ecc_hist_cupy` is the reference, the CuPy port of `ecc_hist_numpy` (kept for the
-intro's small examples and the self-test). Each notebook replaces it with one tool
-and checks the integer result exactly: max |Δχ| == 0 and Σ hist == 0.
+Voxel (i, j, k) of the standardised field ν owns eight cells (its vertex, three edges, three faces, one
+cube); a cell is born at the minimum of ν over its corners, and χ(ν) = Σ_cells (−1)^dim [birth ≥ ν].
+ν is binned once on the device into K integer bins over [NU_LO, NU_HI); binning commutes with the
+minimum, so every tool's signed histogram of births is checked bit for bit against `ecc_hist_cupy`,
+and χ at a bin edge is the histogram summed from the top. For a Gaussian field (Hamilton, Gott &
+Weinberg 1986, ApJ 309, 1) E[χ(ν)] / V = λ³ / (2π)² · (ν² − 1) · exp(−ν²/2) with λ² = ⟨|∇f|²⟩ / (3⟨f²⟩).
 """
 
 import json, os, time
 from pathlib import Path
 import numpy as np
 
+# CppJIT reads the interpreter arguments when `import cppjit` runs, so the optimisation level is set here, before it.
 os.environ.setdefault("CPPINTEROP_EXTRA_INTERPRETER_ARGS", "-O3")
 
 K_BINS          = 128
 NU_LO, NU_HI    = -4.0, 4.0      # bin width 1/16, exact in binary
 R_SMOOTH_VOXELS = 3.0
 SEED            = 2026
+SIGMA8          = 0.834
 CANONICAL_N     = 512
 SWEEP_N         = (64, 128, 256, 512, 1024)
 BOX_MPC         = 1000.0         # comoving box side in Mpc/h, the Quijote fiducial
+DEMO_BOX_MPC    = 250.0          # the intro's small Zel'dovich pictures
+WARMUP, REPEATS = 2, 5
+SWEEP_BUDGET_S  = 120.0
 
-# As this is a canonical asset, allow arbitrary callers to resolve this file's location
 HERE         = Path(__file__).resolve().parent
 TIMINGS_DIR  = HERE / "timings"
 MACHINE_PATH = HERE / "machine.json"
@@ -66,27 +48,15 @@ STAGE_NOTEBOOK = {
     "cppjit_cub":   "94__cosmic_web__cppjit__cuda_kernel.ipynb",
     "cppjit_cuda":  "94__cosmic_web__cppjit__cuda_kernel.ipynb",
 }
+RUN_INTRO_FIRST = f"run {STAGE_NOTEBOOK['cupy']} first"
 
 
 # --- Field generation ---------------------------------------------------------
 
 def _xp(a):
     """numpy or cupy, whichever module owns `a`."""
-    try:
-        import cupy
-        return cupy.get_array_module(a)
-    except ImportError:
-        return np
-
-
-def _cupy_available():
-    """True when CuPy imports and sees a device."""
-    try:
-        import cupy
-        cupy.cuda.runtime.getDeviceCount()
-        return True
-    except Exception:
-        return False
+    import cupy
+    return cupy.get_array_module(a)
 
 
 def kgrid(n):
@@ -160,27 +130,20 @@ def standardise(field, sigma0_sq, sigma1_sq):
     return nu.astype(np.float32), lam
 
 
-def make_nu_field(n, seed=SEED, r_voxels=R_SMOOTH_VOXELS, box_mpc=BOX_MPC):
-    """Standardised smoothed Gaussian field ν (float32, n³) and its λ."""
-    return standardise(*smooth_k(gaussian_field(n, seed, box_mpc), r_voxels))
+def make_nu_field_device(n, slabs=16):
+    """ν (CuPy float32, n³) and λ, generated on the device: white noise, the BBKS spectrum, a Gaussian smoothing, standardised.
 
-
-def make_nu_field_device(n, seed=SEED, r_voxels=R_SMOOTH_VOXELS, box_mpc=BOX_MPC, slabs=16):
-    """ν (CuPy float32, n³) and λ, generated on the device: the host never holds the cube.
-
-    The same model as `make_nu_field` (white noise, the BBKS spectrum, a Gaussian
-    smoothing over r_voxels, standardised) in float32, a different random draw from
-    the host generator. One complex64 spectrum is held; the amplitude and the power
-    are evaluated slab by slab so that no second full-size array appears."""
+    One complex64 spectrum is held; the amplitude and the power are evaluated slab by slab so that no second
+    full-size array appears."""
     import cupy as cp
-    rng = cp.random.default_rng(seed)
+    rng = cp.random.default_rng(SEED)
     white = rng.standard_normal((n, n, n), dtype=cp.float32)
     fhat = cp.fft.rfftn(white)
     del white
     k = cp.asarray(2.0 * np.pi * np.fft.fftfreq(n), dtype=cp.float32)
     kz = cp.asarray(2.0 * np.pi * np.fft.rfftfreq(n), dtype=cp.float32)
     weights = cp.asarray(rfft_weights(n), dtype=cp.float32)[None, None, :]
-    scale, half_r2 = np.float32(n / box_mpc), np.float32(0.5 * r_voxels ** 2)
+    scale, half_r2 = np.float32(n / BOX_MPC), np.float32(0.5 * R_SMOOTH_VOXELS ** 2)
     sigma0_sq = sigma1_sq = 0.0
     step = max(1, n // slabs)
     for i0 in range(0, n, step):
@@ -207,104 +170,80 @@ def make_nu_field_device(n, seed=SEED, r_voxels=R_SMOOTH_VOXELS, box_mpc=BOX_MPC
     return field, lam
 
 
-def lambda_finite_difference(nu):
-    """λ from central differences on the periodic grid: sqrt(⟨|∇f|²⟩ / 3⟨f²⟩)."""
-    f = np.asarray(nu, dtype=np.float64)
-    grad_sq = sum(((np.roll(f, -1, a) - np.roll(f, 1, a)) * 0.5) ** 2 for a in range(3))
-    return float(np.sqrt(grad_sq.mean() / (3.0 * (f ** 2).mean())))
+def bin_edges(k=K_BINS):
+    """Lower edge of every bin: bin b covers [edge_b, edge_b + (NU_HI − NU_LO)/k)."""
+    return NU_LO + (NU_HI - NU_LO) * np.arange(k) / k
 
 
-def bin_edges(k=K_BINS, lo=NU_LO, hi=NU_HI):
-    """Lower edge of every bin: bin b covers [edge_b, edge_b + (hi − lo)/k)."""
-    return lo + (hi - lo) * np.arange(k) / k
-
-
-def quantise(nu, k=K_BINS, lo=NU_LO, hi=NU_HI):
+def quantise(nu, k=K_BINS):
     """Bin index of every voxel as int32: the one binning rule, on whichever device holds ν."""
     xp = _xp(nu)
-    idx = xp.floor((xp.asarray(nu, dtype=xp.float64) - lo) * (k / (hi - lo)))
+    idx = xp.floor((xp.asarray(nu, dtype=xp.float64) - NU_LO) * (k / (NU_HI - NU_LO)))
     return xp.clip(idx, 0, k - 1).astype(xp.int32)
 
 
-def _cache_name(kind, n, k, seed, r_voxels, suffix):
-    return DATA_DIR / f"{kind}_n{n}_k{k}_r{r_voxels:g}_seed{seed}{suffix}"
+def _cache_path(kind, n, suffix):
+    return DATA_DIR / f"{kind}_n{n}_k{K_BINS}_r{R_SMOOTH_VOXELS:g}_seed{SEED}{suffix}"
 
 
+# The fields built in this process, by size: every runner of a notebook shares one device copy.
 _FIELDS = {}
 
 
-def make_binned_field(n, k=K_BINS, seed=SEED, r_voxels=R_SMOOTH_VOXELS):
-    """(q, lam): the binned field at size n, built once per process and cached under data/ (see `_make_binned_field`)."""
-    key = (n, k, seed, r_voxels)
-    if key not in _FIELDS:
-        _FIELDS[key] = _make_binned_field(n, k, seed, r_voxels)
-    return _FIELDS[key]
+def make_binned_field(n):
+    """(q, lam): the binned test field at size n (int32, on the device) and its λ.
 
-
-def _make_binned_field(n, k=K_BINS, seed=SEED, r_voxels=R_SMOOTH_VOXELS):
-    """Binned test field q (int32, n³, on the device) and its λ.
-
-    Generated and binned on the device, cached under data/ as uint8 (one byte per
-    voxel holds the K bins) and widened to int32 on load. Without CuPy the host
-    generator runs and q is a NumPy array."""
+    Generated and binned on the device once per size, cached under data/ as uint8 and widened to int32 on load."""
+    if n in _FIELDS:
+        return _FIELDS[n]
+    import cupy as cp
     DATA_DIR.mkdir(exist_ok=True)
-    path = _cache_name("field", n, k, seed, r_voxels, ".npz")
-    on_device = _cupy_available()
+    path = _cache_path("field", n, ".npz")
     if path.exists():
         with np.load(path) as f:
-            q8, lam = f["q"], float(f["lam"])
-        if on_device:
-            import cupy as cp
-            q = cp.asarray(q8).astype(cp.int32)
-            release_pool()
-            return q, lam
-        return q8.astype(np.int32), lam
-    if on_device:
-        import cupy as cp
-        nu, lam = make_nu_field_device(n, seed, r_voxels)
-        q = quantise(nu, k)
+            q, lam = cp.asarray(f["q"]).astype(cp.int32), float(f["lam"])
+    else:
+        nu, lam = make_nu_field_device(n)
+        q = quantise(nu)
         del nu
         np.savez(path, q=cp.asnumpy(q.astype(cp.uint8)), lam=lam)
-        release_pool()
-        return q, lam
-    nu, lam = make_nu_field(n, seed, r_voxels)
-    q = quantise(nu, k)
-    np.savez(path, q=q.astype(np.uint8), lam=lam)
+    release_pool()
+    _FIELDS[n] = (q, lam)
     return q, lam
 
 
-# --- Reference and oracles ------------------------------------------------------
+def field(n):
+    """The binned field at size n, int32 on the device, built once per size so that no timed call pays for it."""
+    return make_binned_field(n)[0]
 
-def _cell_births(q, reduce=np.minimum, roll=np.roll):
-    """Births of the eight cells each voxel owns: (vertex, (ex, ey, ez), (fxy, fxz, fyz), cube)."""
-    ex, ey, ez = (reduce(q, roll(q, -1, a)) for a in (0, 1, 2))
-    fxy = reduce(ex, roll(ex, -1, 1))
-    fxz = reduce(ex, roll(ex, -1, 2))
-    fyz = reduce(ey, roll(ey, -1, 2))
-    c = reduce(fxy, roll(fxy, -1, 2))
+
+# --- Reference and checks ---------------------------------------------------------
+
+def ecc_cells_cupy(q):
+    """Births of the eight cells each voxel owns, on the device: (vertex, (ex, ey, ez), (fxy, fxz, fyz), cube)."""
+    import cupy as cp
+    ex = cp.minimum(q, cp.roll(q, -1, 0))
+    ey = cp.minimum(q, cp.roll(q, -1, 1))
+    ez = cp.minimum(q, cp.roll(q, -1, 2))
+    fxy = cp.minimum(ex, cp.roll(ex, -1, 1))
+    fxz = cp.minimum(ex, cp.roll(ex, -1, 2))
+    fyz = cp.minimum(ey, cp.roll(ey, -1, 2))
+    c = cp.minimum(fxy, cp.roll(fxy, -1, 2))
     return q, (ex, ey, ez), (fxy, fxz, fyz), c
 
 
-def ecc_cells_numpy(q):
-    """Births of the eight cells each voxel owns: (vertex, (ex, ey, ez), (fxy, fxz, fyz), cube)."""
-    # Neighbours: rolling by -1 along an axis puts each voxel's +1 neighbour on top of it, wrapping around.
-    # Births: a cell is born at the lowest of its corners, so each step is one minimum of two arrays.
-    ex = np.minimum(q, np.roll(q, -1, 0))        # edge to the +x neighbour
-    ey = np.minimum(q, np.roll(q, -1, 1))        # edge to the +y neighbour
-    ez = np.minimum(q, np.roll(q, -1, 2))        # edge to the +z neighbour
-    fxy = np.minimum(ex, np.roll(ex, -1, 1))     # face spanned by the +x and +y edges
-    fxz = np.minimum(ex, np.roll(ex, -1, 2))     # face spanned by the +x and +z edges
-    fyz = np.minimum(ey, np.roll(ey, -1, 2))     # face spanned by the +y and +z edges
-    c = np.minimum(fxy, np.roll(fxy, -1, 2))     # the cube: the +xy face and the one above it
-    return q, (ex, ey, ez), (fxy, fxz, fyz), c
-
-
-def ecc_hist_numpy(q, k=K_BINS):
-    """Signed histogram of cell births (int64, length k): +1 per vertex and face, -1 per edge and cube."""
-    v, (ex, ey, ez), (fxy, fxz, fyz), c = ecc_cells_numpy(q)
-    # Histogram: bincount sorts one cell array's births into the k bins; the signed sum is the token histogram.
-    bc = lambda a: np.bincount(a.ravel(), minlength=k).astype(np.int64)
+def ecc_hist_cupy(q, k=K_BINS):
+    """The reference: signed histogram of cell births (int64, length k) on the device, +1 per vertex and face, -1 per edge and cube."""
+    import cupy as cp
+    v, (ex, ey, ez), (fxy, fxz, fyz), c = ecc_cells_cupy(q)
+    bc = lambda a: cp.bincount(a.ravel(), minlength=k)
     return bc(v) - bc(ex) - bc(ey) - bc(ez) + bc(fxy) + bc(fxz) + bc(fyz) - bc(c)
+
+
+def ecc_hist_reference(q, k=K_BINS):
+    """The reference histogram of a device field as a host int64 array."""
+    import cupy as cp
+    return cp.asnumpy(ecc_hist_cupy(q, k)).astype(np.int64)
 
 
 def ecc_from_hist(hist):
@@ -313,61 +252,28 @@ def ecc_from_hist(hist):
     return np.cumsum(h[::-1])[::-1]
 
 
-def ecc_numpy(q, k=K_BINS):
-    """Euler characteristic curve (int64, length k) of a binned host field, from the NumPy histogram."""
-    return ecc_from_hist(ecc_hist_numpy(q, k))
-
-
-def ecc_cells_cupy(q):
-    """Births of the eight cells each voxel owns, on the device: (vertex, (ex, ey, ez), (fxy, fxz, fyz), cube)."""
-    import cupy as cp
-    # Neighbours: rolling by -1 along an axis puts each voxel's +1 neighbour on top of it, wrapping around.
-    # Births: a cell is born at the lowest of its corners, so each step is one minimum of two arrays.
-    ex = cp.minimum(q, cp.roll(q, -1, 0))        # edge to the +x neighbour
-    ey = cp.minimum(q, cp.roll(q, -1, 1))        # edge to the +y neighbour
-    ez = cp.minimum(q, cp.roll(q, -1, 2))        # edge to the +z neighbour
-    fxy = cp.minimum(ex, cp.roll(ex, -1, 1))     # face spanned by the +x and +y edges
-    fxz = cp.minimum(ex, cp.roll(ex, -1, 2))     # face spanned by the +x and +z edges
-    fyz = cp.minimum(ey, cp.roll(ey, -1, 2))     # face spanned by the +y and +z edges
-    c = cp.minimum(fxy, cp.roll(fxy, -1, 2))     # the cube: the +xy face and the one above it
-    return q, (ex, ey, ez), (fxy, fxz, fyz), c
-
-
-def ecc_hist_cupy(q, k=K_BINS):
-    """The reference: signed histogram of cell births (int64, length k) on the device, +1 per vertex and face, -1 per edge and cube."""
-    import cupy as cp
-    v, (ex, ey, ez), (fxy, fxz, fyz), c = ecc_cells_cupy(q)
-    # Histogram: bincount sorts one cell array's births into the k bins; the signed sum is the token histogram.
-    bc = lambda a: cp.bincount(a.ravel(), minlength=k)
-    return bc(v) - bc(ex) - bc(ey) - bc(ez) + bc(fxy) + bc(fxz) + bc(fyz) - bc(c)
-
-
-def ecc_hist_reference(q, k=K_BINS):
-    """The signed histogram as a host int64 array, from the CuPy reference on a device field or the NumPy one on a host field."""
-    if _xp(q) is np:
-        return ecc_hist_numpy(q, k)
-    import cupy as cp
-    return cp.asnumpy(ecc_hist_cupy(q, k))
-
-
 def verify_equal(chi, chi_ref):
     """max |Δχ| between a tool's curve and the reference, as an int; the gate is 0."""
     d = np.asarray(chi, dtype=np.int64) - np.asarray(chi_ref, dtype=np.int64)
     return int(np.max(np.abs(d)))
 
 
-def chi_reference(n, k=K_BINS, seed=SEED, r_voxels=R_SMOOTH_VOXELS):
-    """Reference curve for the cached field of size n, computed once with the reference and cached under data/."""
+def chi_reference(n):
+    """The reference curve of the test field at size n, computed once and cached under data/."""
     DATA_DIR.mkdir(exist_ok=True)
-    path = _cache_name("chi", n, k, seed, r_voxels, ".npy")
+    path = _cache_path("chi", n, ".npy")
     if path.exists():
         return np.load(path)
-    q, _ = make_binned_field(n, k, seed, r_voxels)
-    chi = ecc_from_hist(ecc_hist_reference(q, k))
-    del q
+    chi = ecc_from_hist(ecc_hist_reference(field(n)))
     release_pool()
     np.save(path, chi)
     return chi
+
+
+def _gate(n, hist):
+    """(max|Δχ| against the reference at size n, Σhist) of a tool's histogram; both are 0 when it passes."""
+    hist = np.asarray(hist, dtype=np.int64)
+    return verify_equal(ecc_from_hist(hist), chi_reference(n)), int(hist.sum())
 
 
 def euler_2d(mask):
@@ -377,87 +283,6 @@ def euler_2d(mask):
     e = int((m[1:, :] & m[:-1, :]).sum() + (m[:, 1:] & m[:, :-1]).sum())
     f = int((m[1:, 1:] & m[:-1, 1:] & m[1:, :-1] & m[:-1, :-1]).sum())
     return v, e, f, v - e + f
-
-
-def islands_minus_lakes(mask):
-    """(islands, lakes, islands − lakes): 4-connected islands, 8-connected lakes away from the border."""
-    from scipy import ndimage
-    m = np.asarray(mask, dtype=bool)
-    _, islands = ndimage.label(m)
-    labels, n_background = ndimage.label(~m, structure=np.ones((3, 3), dtype=int))
-    border = set(np.unique(np.concatenate(
-        [labels[0], labels[-1], labels[:, 0], labels[:, -1]]))) - {0}
-    lakes = n_background - len(border)
-    return islands, lakes, islands - lakes
-
-
-def _ecc_enumerated(q, b):
-    """χ of {q ≥ b} by visiting every cell of the periodic complex; for tiny grids only."""
-    n = q.shape[0]
-    present = np.asarray(q) >= b
-    chi = 0
-    for i in range(n):
-        for j in range(n):
-            for k in range(n):
-                i1, j1, k1 = (i + 1) % n, (j + 1) % n, (k + 1) % n
-                cells = {
-                    0: [[(i, j, k)]],
-                    1: [[(i, j, k), (i1, j, k)], [(i, j, k), (i, j1, k)], [(i, j, k), (i, j, k1)]],
-                    2: [[(i, j, k), (i1, j, k), (i, j1, k), (i1, j1, k)],
-                        [(i, j, k), (i1, j, k), (i, j, k1), (i1, j, k1)],
-                        [(i, j, k), (i, j1, k), (i, j, k1), (i, j1, k1)]],
-                    3: [[(a, b_, c) for a in (i, i1) for b_ in (j, j1) for c in (k, k1)]],
-                }
-                for dim, group in cells.items():
-                    for corners in group:
-                        if all(present[p] for p in corners):
-                            chi += (-1) ** dim
-    return chi
-
-
-def _small_grid(n, voxels):
-    q = np.zeros((n, n, n), dtype=np.int32)
-    for v in voxels:
-        q[v] = 1
-    return q
-
-
-def check_small_grids(seed=SEED):
-    """Assert the reference on hand-countable grids and against explicit cell enumeration; prints a table."""
-    cases = [
-        ("single voxel",       _small_grid(4, [(1, 1, 1)]), 1),
-        ("two adjacent",       _small_grid(4, [(1, 1, 1), (2, 1, 1)]), 1),
-        ("2^3 block",          _small_grid(4, [(i, j, k) for i in (0, 1) for j in (0, 1) for k in (0, 1)]), 1),
-        ("hollow 3^3 shell",   _small_grid(5, [(i, j, k) for i in range(3) for j in range(3) for k in range(3)
-                                               if (i, j, k) != (1, 1, 1)]), 2),
-        ("periodic line",      _small_grid(4, [(i, 1, 1) for i in range(4)]), 0),
-        ("periodic plane",     _small_grid(4, [(i, j, 1) for i in range(4) for j in range(4)]), 0),
-        ("full box",           np.ones((4, 4, 4), dtype=np.int32), 0),
-    ]
-    ok = True
-    print(f"  {'case':<18} {'expected':>8} {'numpy':>6} {'enumerated':>10}")
-    for name, q, expected in cases:
-        got = int(ecc_numpy(q, 2)[1])
-        enum = _ecc_enumerated(q, 1)
-        ok &= got == expected == enum
-        print(f"  {name:<18} {expected:>8} {got:>6} {enum:>10}  {'ok' if got == expected == enum else 'MISMATCH'}")
-    rng = np.random.default_rng(seed)
-    q = rng.integers(0, 8, (6, 6, 6), dtype=np.int32)
-    chi = ecc_numpy(q, 8)
-    enum = np.array([_ecc_enumerated(q, b) for b in range(8)])
-    same = np.array_equal(chi, enum) and int(ecc_hist_numpy(q, 8).sum()) == 0
-    ok &= same
-    print(f"  {'random 6^3, 8 bins':<18} {'curve':>8} {'':>6} {'':>10}  {'ok' if same else 'MISMATCH'}")
-    for trial in range(3):
-        m = rng.random((12, 12)) < 0.55
-        v, e, f, chi2 = euler_2d(m)
-        islands, lakes, diff = islands_minus_lakes(m)
-        same = chi2 == diff
-        ok &= same
-        print(f"  {'random 12x12 mask':<18} {'V-E+F':>8} {chi2:>6} {diff:>10}  {'ok' if same else 'MISMATCH'}"
-              f"   (V={v} E={e} F={f}; islands={islands} lakes={lakes})")
-    assert ok, "check_small_grids failed"
-    return ok
 
 
 # --- Gaussian expectation ---------------------------------------------------------
@@ -493,11 +318,8 @@ def overlay_residual(edges, chi_meas, chi_pred):
     return rel, zero_crossings(edges, chi_meas)
 
 
-# Relative residual max|χ − E[χ]| / max|E[χ]| allowed for one realisation against the
-# Gaussian expectation: three times the rms over eight seeds, from tools/seed_study.py
-# (2026-10-08, N = 256^3, R = 3, K = 128: rms 0.0351, max 0.0460, zero crossings within
-# 0.02 of ±1, λ_fd/λ 0.98; at 128^3 the R sweep gave λ_fd/λ 0.85, 0.92, 0.95, 0.98, 0.99
-# for R = 1, 1.5, 2, 3, 4).
+# The relative residual one realisation may show against the Gaussian expectation: three times the rms over
+# eight seeds at 256^3 with R = 3 and K = 128 (2026-10-08: rms 0.035, max 0.046, crossings within 0.02 of ±1).
 ANALYTIC_TOL = 0.105
 
 
@@ -505,32 +327,21 @@ ANALYTIC_TOL = 0.105
 
 def release_pool():
     """Return the CuPy pool's unused blocks to the device, so this kernel holds only its live arrays."""
-    if _cupy_available():
-        import cupy as cp
-        cp.get_default_memory_pool().free_all_blocks()
+    import cupy as cp
+    cp.get_default_memory_pool().free_all_blocks()
 
 
-def timed_run(fn, *args, warmup=2, repeats=5, label="", prepare=None):
-    """Time fn(*args) with warmups + repeats. Returns median / min / max [s].
-
-    fn must not return until its work is done: every runner in this tutorial
-    is responsible for handling synchronization and returns host arrays.
-    When supplied, prepare() runs before each invocation and outside the timer.
-    """
+def timed_run(fn, *args, warmup=WARMUP, repeats=REPEATS):
+    """{median_s, min_s, max_s, repeats, samples_s} of fn(*args) after `warmup` calls; fn returns only when its work is done."""
     for _ in range(warmup):
-        if prepare is not None:
-            prepare()
         fn(*args)
     ts = []
     for _ in range(repeats):
-        if prepare is not None:
-            prepare()
         t0 = time.perf_counter()
         fn(*args)
         ts.append(time.perf_counter() - t0)
     release_pool()
     return {
-        "label":    label,
         "median_s": float(np.median(ts)),
         "min_s":    float(np.min(ts)),
         "max_s":    float(np.max(ts)),
@@ -539,138 +350,89 @@ def timed_run(fn, *args, warmup=2, repeats=5, label="", prepare=None):
     }
 
 
-def measure(stage, run, n, *args, record=True, prepare=None, warmup=2, repeats=5, compile_s=0.0,
-            cold_note="first call", quiet=False):
+def _gvoxel_s(n, seconds):
+    return n ** 3 / seconds / 1e9
+
+
+def measure(stage, run, n, *args, record=True, prepare=None, compile_s=0.0, cold_note="first call", quiet=False):
     """Time run(n, *args) cold and warm, check the integer gate against the reference at size n, return the record.
 
-    The field is built and `prepare(n)` is called before the cold call, which is the first call's wall time plus
-    `compile_s`. The warm time is `timed_run` with `warmup` and `repeats`. The gate is max|Δχ| == 0 against
-    `chi_reference(n)` and Σhist == 0, and a FAIL raises AssertionError. The record line is printed unless `quiet`.
-    With `record`, the record is written to timings/<stage>.json.
-    """
+    `prepare(n)` runs before the timer; `compile_s` is added to the cold time; the record line is printed unless
+    `quiet`; with `record`, the record is written to timings/<stage>.json. A failed gate raises."""
     field(n)
     if prepare is not None:
         prepare(n)
     t0 = time.perf_counter()
     hist = np.asarray(run(n, *args))
     cold_s = compile_s + time.perf_counter() - t0
-    warm = timed_run(run, n, *args, warmup=warmup, repeats=repeats, label=stage)
-    max_abs_diff = verify_equal(ecc_from_hist(hist), chi_reference(n))
-    hist_sum = int(hist.sum())
+    warm = timed_run(run, n, *args)
+    max_abs_diff, hist_sum = _gate(n, hist)
     ok = max_abs_diff == 0 and hist_sum == 0
     note = f" ({cold_note})" if cold_note else ""
     line = (f"[{stage}] N={n}^3 K={K_BINS} | cold {cold_s * 1e3:8.1f} ms{note} | warm {warm['median_s'] * 1e3:8.1f} ms"
-            f" = {n ** 3 / warm['median_s'] / 1e9:.3f} Gvoxel/s | max|Δχ| {max_abs_diff} | Σ {hist_sum} | {'PASS' if ok else 'FAIL'}")
+            f" = {_gvoxel_s(n, warm['median_s']):.3f} Gvoxel/s | max|Δχ| {max_abs_diff} | Σ {hist_sum} | {'PASS' if ok else 'FAIL'}")
     if not quiet:
         print(line)
-    assert ok, line
-    extra = {"compile_s": compile_s} if compile_s else {}
-    result = {**warm, "n": n, "k": K_BINS, "cold_s": cold_s, "max_abs_diff": max_abs_diff, "hist_sum": hist_sum,
-              "hist": hist.tolist(), **extra}
+    if not ok:
+        raise RuntimeError(line)
+    result = {"stage": stage, "n": n, "k": K_BINS, **warm, "cold_s": cold_s, "max_abs_diff": max_abs_diff,
+              "hist_sum": hist_sum, "hist": hist.tolist()}
+    if compile_s:
+        result["compile_s"] = compile_s
     if record:
-        save_timing(warm, stage, n, K_BINS, cold_s=cold_s, max_abs_diff=max_abs_diff, hist=hist, **extra)
+        TIMINGS_DIR.mkdir(exist_ok=True)
+        (TIMINGS_DIR / f"{stage}.json").write_text(json.dumps(result, indent=2))
     return result
-
-
-def stage_path(stage):
-    """timings/<stage>.json."""
-    return TIMINGS_DIR / f"{stage}.json"
-
-
-def save_timing(result, stage, n, k, hardware="gpu", dtype="int32", hist=None, **extra):
-    """Write the stage's headline record to timings/<stage>.json; a re-run replaces the file.
-
-    `hist`, when given, is stored as a list with its total under `hist_sum`.
-    """
-    TIMINGS_DIR.mkdir(exist_ok=True)
-    record = {
-        "stage":    stage,
-        "n":        n,
-        "k":        k,
-        "hardware": hardware,
-        "dtype":    dtype,
-        "median_s": result["median_s"],
-        "min_s":    result["min_s"],
-        "max_s":    result["max_s"],
-        "repeats":  result["repeats"],
-        "samples_s": result["samples_s"],
-    }
-    record.update(extra)
-    if hist is not None:
-        hist = np.asarray(hist)
-        record["hist"] = hist.tolist()
-        record.setdefault("hist_sum", int(hist.sum()))
-    stage_path(stage).write_text(json.dumps(record, indent=2))
-    return record
 
 
 def load_stage(stage):
     """Read timings/<stage>.json; a missing file names the notebook to run first."""
-    path = stage_path(stage)
+    path = TIMINGS_DIR / f"{stage}.json"
     if not path.exists():
-        raise FileNotFoundError(f"no timings/{stage}.json yet: run "
-                                f"{STAGE_NOTEBOOK.get(stage, 'the notebook that owns it')} first")
+        raise FileNotFoundError(f"no timings/{stage}.json yet: run {STAGE_NOTEBOOK.get(stage, 'the notebook that owns it')} first")
     return json.loads(path.read_text())
 
 
 def _attach(stage, key, value):
     record = load_stage(stage)
     record[key] = value
-    stage_path(stage).write_text(json.dumps(record, indent=2))
-    return record
+    (TIMINGS_DIR / f"{stage}.json").write_text(json.dumps(record, indent=2))
 
 
-def save_sweep(stage, run, sizes=None, warmup=1, repeats=3, budget_s=120.0, first_call=False, prepare=None):
+def save_sweep(stage, run, first_call=False, prepare=None):
     """Measure the sweep over the sizes the stage affords and attach it to the stage file.
 
     With `first_call`, the first call at every size is timed too, after `prepare(n)`."""
-    sweep = timed_sweep(run, sweep_sizes(stage) if sizes is None else sizes, warmup=warmup, repeats=repeats,
-                        budget_s=budget_s, bytes_per_voxel=_stage_budget(stage), first_call=first_call, prepare=prepare)
-    _attach(stage, "sweep", sweep)
-
-
-def save_launches(stage, n_kernels, n, **extra):
-    """Attach a launch count (and any other probe scalars) to the stage file."""
-    return _attach(stage, "launches", {"n": n, "kernels": n_kernels, **extra})
-
-
-def save_trace(stage, rows):
-    """Attach `nsys_trace_rows` output to the stage file."""
-    return _attach(stage, "trace", [list(r) for r in rows])
+    _attach(stage, "sweep", timed_sweep(run, sweep_sizes(stage), DEVICE_BYTES_PER_VOXEL[stage], first_call, prepare))
 
 
 def compile_report(stage, jaxpr, compiled):
-    """Print what the trace and the executable contain and attach the counts to the stage file.
-
-    `jaxpr` is the function's trace and `compiled` its executable. The lines give the jaxpr's length and primitives,
-    then the executable's fusions, scatters and temporaries in full-size arrays at the stage's size."""
-    n_lines, primitives = jaxpr_summary(jaxpr)
-    print(f"jaxpr: {n_lines} lines; primitives: {', '.join(primitives)}")
-    n_fusion, n_scatter = hlo_summary(compiled.as_text())
+    """Print the jaxpr's length and primitives and the executable's fusions, scatters and temporaries; attach the counts."""
+    import re
+    lines = str(jaxpr).splitlines()
+    rhs = [ln.split(" = ", 1)[1] for ln in lines if " = " in ln]
+    primitives = sorted({r.split("[")[0].split()[0] for r in rhs if not r.startswith("{")})
+    print(f"jaxpr: {len(lines)} lines; primitives: {', '.join(primitives)}")
+    text = compiled.as_text()
+    n_fusion, n_scatter = len(re.findall(r", kind=k", text)), len(re.findall(r"\bscatter\(", text))
     temp_bytes = int(compiled.memory_analysis().temp_size_in_bytes)
     nbytes = load_stage(stage)["n"] ** 3 * 4
     print(f"compiled: {n_fusion} fusions, {n_scatter} scatters; temporaries {temp_bytes / nbytes:.1f} full-size arrays")
     _attach(stage, "compile", {"fusions": n_fusion, "scatters": n_scatter, "temp_bytes": temp_bytes})
 
 
-def load_timings():
-    """{stage: record} for every timings/*.json (empty when none exist)."""
-    if not TIMINGS_DIR.exists():
-        return {}
-    return {p.stem: json.loads(p.read_text()) for p in sorted(TIMINGS_DIR.glob("*.json"))}
-
-
 def load_stages(stages, extras=()):
     """The records of `stages` and `extras` for the synthesis, after its checks.
 
     Stops when machine.json or the `cupy` record is missing, or the records are at different sizes. A missing stage
-    is named with its notebook and a missing extra is skipped.
-    """
+    is named with its notebook and a missing extra is skipped."""
     machine = load_machine()
     if not machine.get("device_name"):
-        raise SystemExit("no machine.json: run 90__cosmic_web__intro.ipynb first")
-    by_stage = load_timings()
-    require_stages(by_stage, ["cupy"])
+        raise SystemExit(f"no machine.json: {RUN_INTRO_FIRST}")
+    by_stage = ({p.stem: json.loads(p.read_text()) for p in sorted(TIMINGS_DIR.glob("*.json"))}
+                if TIMINGS_DIR.exists() else {})
+    if "cupy" not in by_stage:
+        raise SystemExit(f"no timing recorded for the reference: {RUN_INTRO_FIRST}, then this notebook")
     for s in stages:
         if s not in by_stage:
             print(f"stage {s!r} not recorded: run {STAGE_NOTEBOOK.get(s, s)} to add it")
@@ -682,6 +444,15 @@ def load_stages(stages, extras=()):
     return present
 
 
+def stage_table(by_stage, labels):
+    """Print one line per stage: size, bins, the warm median, the cold time and the gate."""
+    print(f"\n{'tool':<12} {'N':>5} {'K':>4} {'warm ms':>9} {'cold ms':>9} {'max|Δχ|':>8} {'Σ':>3}")
+    for s, r in by_stage.items():
+        cold = f"{r['cold_s'] * 1e3:9.1f}" if "cold_s" in r else f"{'-':>9}"
+        print(f"{labels[s]:<12} {r['n']:>4}^3 {r['k']:>4} {r['median_s'] * 1e3:9.2f} {cold} "
+              f"{r.get('max_abs_diff', '?'):>8} {r.get('hist_sum', '?'):>3}")
+
+
 def wall_breakdown(record):
     """{kernel_s, memcpy_s, other_s} of one call, from a stage record's trace and wall time."""
     rows, wall_s = record["trace"], record["launches"]["wall_s"]
@@ -690,36 +461,22 @@ def wall_breakdown(record):
     return {"kernel_s": kernel, "memcpy_s": copies, "other_s": max(wall_s - kernel - copies, 0.0)}
 
 
-def require_stages(by_stage, stages, key=None):
-    """Raise unless every stage is recorded (with `key` when given), naming the notebooks to run."""
-    missing = [s for s in stages if s not in by_stage or (key and key not in by_stage[s])]
-    if missing:
-        notebooks = sorted({STAGE_NOTEBOOK.get(s, s) for s in missing})
-        raise SystemExit(f"no {key or 'timing'} recorded for: {', '.join(missing)}. "
-                         f"Run {', '.join(notebooks)}, then this notebook.")
+def timed_sweep(fn, sizes, bytes_per_voxel, first_call=False, prepare=None):
+    """[{n, median_s, ...}] at every sweep size, each checked against the reference; stops early and names the skipped sizes.
 
-
-def timed_sweep(fn, sizes=None, warmup=1, repeats=3, budget_s=120.0, check=True, bytes_per_voxel=None,
-                first_call=False, prepare=None):
-    """[{n, median_s, ...}] at every sweep size. The sweep stops early and names the skipped sizes.
-
-    fn(n) returns the host histogram for the prebuilt field of size n. Every tool
-    runs the identical field at every size. With `check`, the curve is compared
-    with the reference at every size and the gate must hold. With `first_call`,
-    `prepare(n)` runs first and the first call is timed as `first_s`. The sweep
-    stops at a size that would overrun the time budget, or whose `bytes_per_voxel`
-    the free device memory does not hold."""
+    The sweep stops at a size that would overrun SWEEP_BUDGET_S, or whose `bytes_per_voxel` the free device memory
+    does not hold. With `first_call`, `prepare(n)` runs first and the first call is timed as `first_s`."""
     out, dropped, spent, reason = [], [], 0.0, ""
-    sizes = list(sweep_sizes() if sizes is None else sizes)
+    sizes = list(sizes)
     for i, n in enumerate(sizes):
         if out:
             last = out[-1]
             per_run = last["median_s"] * (n / last["n"]) ** 3
-            if spent + per_run * (warmup + repeats) > budget_s:
-                dropped, reason = sizes[i:], f"would overrun the {budget_s:.0f} s budget"
+            if spent + per_run * (WARMUP + REPEATS) > SWEEP_BUDGET_S:
+                dropped, reason = sizes[i:], f"would overrun the {SWEEP_BUDGET_S:.0f} s budget"
                 break
-        free = free_bytes()[1] if bytes_per_voxel else None
-        if free is not None and bytes_per_voxel * n ** 3 > free:
+        free = free_bytes()[1]
+        if bytes_per_voxel * n ** 3 > free:
             dropped = sizes[i:]
             reason = (f"needs {bytes_per_voxel * n ** 3 / 2 ** 30:.1f} GiB of device memory and {free / 2 ** 30:.1f} GiB is free; "
                       "the kernels of the other notebooks hold the rest")
@@ -732,19 +489,16 @@ def timed_sweep(fn, sizes=None, warmup=1, repeats=3, budget_s=120.0, check=True,
         if first_call:
             fn(n)
             row["first_s"] = time.perf_counter() - t0
-        r = timed_run(fn, n, warmup=warmup, repeats=repeats)
+        r = timed_run(fn, n)
         spent += time.perf_counter() - t0
         row.update({"median_s": r["median_s"], "min_s": r["min_s"], "max_s": r["max_s"]})
-        line = (f"  N={n:>4}^3  " + (f"first {row['first_s'] * 1e3:9.2f} ms  " if first_call else "")
-                + f"warm {r['median_s'] * 1e3:9.2f} ms  {n ** 3 / r['median_s'] / 1e9:7.3f} Gvoxel/s")
-        if check:
-            hist = np.asarray(fn(n), dtype=np.int64)
-            row["max_abs_diff"] = verify_equal(ecc_from_hist(hist), chi_reference(n))
-            row["hist_sum"] = int(hist.sum())
-            line += f"  max|Δχ| {row['max_abs_diff']}  Σ {row['hist_sum']}"
-            assert row["max_abs_diff"] == 0 and row["hist_sum"] == 0, f"gate failed at N={n}^3: {row}"
+        row["max_abs_diff"], row["hist_sum"] = _gate(n, fn(n))
+        print(f"  N={n:>4}^3  " + (f"first {row['first_s'] * 1e3:9.2f} ms  " if first_call else "")
+              + f"warm {r['median_s'] * 1e3:9.2f} ms  {_gvoxel_s(n, r['median_s']):7.3f} Gvoxel/s"
+              f"  max|Δχ| {row['max_abs_diff']}  Σ {row['hist_sum']}")
+        if row["max_abs_diff"] != 0 or row["hist_sum"] != 0:
+            raise RuntimeError(f"gate failed at N={n}^3: {row}")
         out.append(row)
-        print(line)
         release_pool()
     if dropped:
         print(f"  sweep stopped before N = {dropped[0]}^3: it {reason}; "
@@ -753,9 +507,9 @@ def timed_sweep(fn, sizes=None, warmup=1, repeats=3, budget_s=120.0, check=True,
 
 
 def sweep_series(by_stage, names):
-    """Read the recorded sweeps into {label: (sizes, Gvoxel/s)}, print the table, return (sizes, series)."""
+    """Print the recorded sweeps as a table of Gvoxel/s per size and tool."""
     rate = {names[s]: ([p["n"] for p in by_stage[s]["sweep"]],
-                       [p["n"] ** 3 / p["median_s"] / 1e9 for p in by_stage[s]["sweep"]])
+                       [_gvoxel_s(p["n"], p["median_s"]) for p in by_stage[s]["sweep"]])
             for s in names}
     sizes = sorted({n for xs, _ in rate.values() for n in xs})
     print(f'{"N":>7}' + "".join(f"{names[s]:>14}" for s in names) + "   Gvoxel/s")
@@ -763,16 +517,15 @@ def sweep_series(by_stage, names):
         cells = [f"{ys[xs.index(n)]:>14.3f}" if n in xs else f'{"-":>14}'
                  for xs, ys in (rate[names[s]] for s in names)]
         print(f"{n:>4}^3 " + "".join(cells))
-    return sizes, rate
 
 
 # --- Bytes models ---------------------------------------------------------------
 
-def bytes_breakdown(tool, n, k=K_BINS, itemsize=4):
+def bytes_breakdown(tool, n):
     """[(operation, count, bytes)] of the DRAM traffic each tool's implementation issues at size n.
 
     The kernel's block flushes are reductions at L2 and never reach DRAM, so its model is the one read of the field."""
-    v = n ** 3 * itemsize
+    v = n ** 3 * 4
     if tool == "cupy":
         return [("roll (read + write)", 7, 2 * v),
                 ("minimum (two reads + write)", 7, 3 * v),
@@ -789,45 +542,31 @@ def bytes_breakdown(tool, n, k=K_BINS, itemsize=4):
     raise ValueError(f"no bytes model for {tool!r}")
 
 
-def bytes_model(tool, n, k=K_BINS, itemsize=4):
+def bytes_model(tool, n):
     """Total bytes of `bytes_breakdown` for the tool at size n."""
-    return sum(count * nbytes for _, count, nbytes in bytes_breakdown(tool, n, k, itemsize))
+    return sum(count * nbytes for _, count, nbytes in bytes_breakdown(tool, n))
 
 
-def roof_time_s(nbytes, gbs):
-    """Time to move nbytes at gbs GB/s."""
-    return nbytes / (gbs * 1e9)
-
-
-def print_bytes_breakdown(tool, n, **model_kw):
-    """Print the tool's traffic model at size n as a table: operation, count, MiB each, MiB total."""
-    rows = bytes_breakdown(tool, n, **model_kw)
+def roof_report(tool, record):
+    """Print the tool's bytes model at the record's size: the table, then its time at the copy roof against the warm time."""
+    n, warm_s = record["n"], record["median_s"]
+    rows = bytes_breakdown(tool, n)
     width = max(len(op) for op, _, _ in rows)
     print(f"{'operation':<{width}} {'count':>7} {'MiB each':>9} {'MiB total':>10}")
     for op, count, nbytes in rows:
-        print(f"{op:<{width}} {count:>7} {to_mib(nbytes):>9.3f} {to_mib(count * nbytes):>10.1f}")
-
-
-def roof_report(tool, record, **model_kw):
-    """Print the tool's bytes model at the record's size: the table, then its time at the copy roof against the warm time."""
-    n, warm_s = record["n"], record["median_s"]
-    print_bytes_breakdown(tool, n, **model_kw)
+        print(f"{op:<{width}} {count:>7} {nbytes / 2**20:>9.3f} {count * nbytes / 2**20:>10.1f}")
     gbs = copy_roof_gbs()
-    model = bytes_model(tool, n, **model_kw)
-    roof_s = roof_time_s(model, gbs)
-    print(f"model {to_mib(model):.0f} MiB -> {roof_s * 1e3:.2f} ms at {gbs:.0f} GB/s; "
+    model = bytes_model(tool, n)
+    roof_s = model / (gbs * 1e9)
+    print(f"model {model / 2**20:.0f} MiB -> {roof_s * 1e3:.2f} ms at {gbs:.0f} GB/s; "
           f"measured warm {warm_s * 1e3:.2f} ms = {warm_s / roof_s:.2f} x the roof")
 
 
 # --- Problem sizing -------------------------------------------------------------
-#
-# Sizes come from SWEEP_N, gated on device memory per stage: the int32 field plus
-# what the implementation holds at its peak, in bytes per voxel. The generator's
-# budget decides which sizes exist at all; a stage that cannot afford a size skips
-# it and names it. The host sees one byte per voxel, the uint8 cache.
+# Device memory each stage holds at its peak, bytes per voxel; a stage skips the sizes it cannot afford.
 
 DEVICE_BYTES_PER_VOXEL = {
-    "generate":    36,   # measured 32 B/voxel at 512^3: the noise, the spectrum, the FFT work areas and the field overlap in the pool
+    "generate":    36,   # 32 B/voxel measured at 512^3 (the noise, the spectrum, the FFT work areas and the field overlap in the pool), with margin
     "cupy":        48,   # the field, nine full-size temporaries and bincount's scratch
     "cupy_views":  36,   # the field, seven preallocated buffers and bincount's scratch
     "jax":         16,   # the field and the intermediates XLA materialises
@@ -842,93 +581,41 @@ DEVICE_FRACTION = 0.9
 
 
 def device_properties():
-    """Name, total memory, L2 size, SM count and threads per SM of device 0 ({} without CuPy)."""
-    try:
-        import cupy
-        p = cupy.cuda.runtime.getDeviceProperties(0)
-    except Exception:
-        return {}
+    """Name, total memory, L2 size, SM count and threads per SM of device 0."""
+    import cupy
+    p = cupy.cuda.runtime.getDeviceProperties(0)
     return {"name": p["name"].decode(), "total_bytes": int(p["totalGlobalMem"]), "l2_bytes": int(p["l2CacheSize"]),
             "sms": int(p["multiProcessorCount"]), "threads_per_sm": int(p["maxThreadsPerMultiProcessor"])}
 
 
-def device_total_bytes():
-    """Total memory of device 0 in bytes (None without CuPy)."""
-    return device_properties().get("total_bytes")
-
-
 def free_bytes():
-    """(host, device) memory free at this moment, in bytes; either is None if unknown."""
-    host = dev = None
-    try:
-        for line in open("/proc/meminfo"):
-            if line.startswith("MemAvailable:"):
-                host = int(line.split()[1]) * 1024
-                break
-    except OSError:
-        pass
-    try:
-        import cupy
-        dev = int(cupy.cuda.runtime.memGetInfo()[0])
-    except Exception:
-        pass
-    return host, dev
-
-
-def _stage_budget(stage):
-    if stage not in DEVICE_BYTES_PER_VOXEL:
-        raise ValueError(f"no memory budget for stage {stage!r}; known: {', '.join(DEVICE_BYTES_PER_VOXEL)}")
-    return DEVICE_BYTES_PER_VOXEL[stage]
+    """(host, device) memory free at this moment, in bytes."""
+    import cupy
+    host = None
+    for line in open("/proc/meminfo"):
+        if line.startswith("MemAvailable:"):
+            host = int(line.split()[1]) * 1024
+            break
+    return host, int(cupy.cuda.runtime.memGetInfo()[0])
 
 
 def _affordable(stage, sizes, device_total):
     """The sizes whose budget for `stage` fits DEVICE_FRACTION of the device."""
-    if device_total is None:
-        return tuple(sizes)
-    return tuple(n for n in sizes if _stage_budget(stage) * n ** 3 <= DEVICE_FRACTION * device_total)
+    return tuple(n for n in sizes if DEVICE_BYTES_PER_VOXEL[stage] * n ** 3 <= DEVICE_FRACTION * device_total)
 
 
 def _derive_sweep():
     """The SWEEP_N sizes the generator and the host afford on this machine."""
     host, _ = free_bytes()
-    dev = device_total_bytes()
+    dev = device_properties()["total_bytes"]
     out = []
     for n in SWEEP_N:
         if host is not None and host < HOST_BYTES_PER_VOXEL * n ** 3:
             break
-        if dev is not None and _stage_budget("generate") * n ** 3 > DEVICE_FRACTION * dev:
+        if DEVICE_BYTES_PER_VOXEL["generate"] * n ** 3 > DEVICE_FRACTION * dev:
             break
         out.append(n)
     return tuple(out)
-
-
-def sweep_sizes(stage=None):
-    """The sweep: every size notebook 90 recorded, or only those `stage` can afford."""
-    machine = load_machine()
-    sizes = tuple(int(n) for n in machine["sweep"]) if machine.get("sweep") else _derive_sweep()
-    if stage is None:
-        return sizes
-    return _affordable(stage, sizes, machine.get("device_bytes", device_total_bytes()))
-
-
-def canonical_n():
-    """Headline size: the value notebook 90 recorded, else CANONICAL_N when every main stage affords it."""
-    machine = load_machine()
-    if machine.get("canonical"):
-        return int(machine["canonical"])
-    return _canonical(_derive_sweep(), device_total_bytes())
-
-
-def setup(stage, note=""):
-    """(N, K) for a notebook: checks the device has room for `stage` at N, builds the field and prints the size, the device and `note`."""
-    if not load_machine().get("canonical"):
-        raise RuntimeError("no machine.json: run 90__cosmic_web__intro.ipynb first")
-    n = canonical_n()
-    check_device_memory(stage, n)
-    q = field(n)
-    device = device_properties().get("name", "the device")
-    print(f"N = {n}^3, K = {K_BINS}: {to_mib(q.nbytes):.0f} MiB of int32 on {device}" + (f"; {note}" if note else ""))
-    return n, K_BINS
 
 
 def _canonical(sizes, device_total):
@@ -936,50 +623,68 @@ def _canonical(sizes, device_total):
     return CANONICAL_N if CANONICAL_N in shared else shared[-1]
 
 
-def check_device_memory(stage, n):
-    """Stop with the remedy when the device memory free right now does not hold `stage`'s budget at size n.
+def sweep_sizes(stage):
+    """The sizes notebook 90 recorded that `stage` can afford."""
+    machine = load_machine()
+    if not machine.get("sweep"):
+        raise RuntimeError(f"no sweep in machine.json: {RUN_INTRO_FIRST}")
+    return _affordable(stage, tuple(int(n) for n in machine["sweep"]), machine["device_bytes"])
 
-    A notebook's kernel keeps its arrays until it is shut down, so the kernels of
-    the notebooks run before this one are the usual holders."""
-    need = _stage_budget(stage) * n ** 3
+
+def canonical_n():
+    """The headline size notebook 90 recorded in machine.json."""
+    machine = load_machine()
+    if not machine.get("canonical"):
+        raise RuntimeError(f"no machine.json: {RUN_INTRO_FIRST}")
+    return int(machine["canonical"])
+
+
+def setup(stage, note=""):
+    """(N, K) for a notebook: checks the device has room for `stage` at N, builds the field and prints the size, the device and `note`.
+
+    A notebook's kernel keeps its arrays until it is shut down, so the kernels of the notebooks run before this one
+    are the usual holders of the memory a stage lacks."""
+    n = canonical_n()
+    need = DEVICE_BYTES_PER_VOXEL[stage] * n ** 3
     free = free_bytes()[1]
-    if free is None or free >= need:
-        return
-    total = device_total_bytes() or 0
-    raise RuntimeError(f"{stage} needs {need / 2 ** 30:.1f} GiB of device memory at N = {n}^3 and {free / 2 ** 30:.1f} GiB "
-                       f"of {total / 2 ** 30:.0f} GiB is free: the kernels of the other notebooks hold the rest. "
-                       "Shut them down, then run this cell again.")
+    if free < need:
+        total = device_properties()["total_bytes"]
+        raise RuntimeError(f"{stage} needs {need / 2 ** 30:.1f} GiB of device memory at N = {n}^3 and {free / 2 ** 30:.1f} GiB "
+                           f"of {total / 2 ** 30:.0f} GiB is free: the kernels of the other notebooks hold the rest. "
+                           "Shut them down, then run this cell again.")
+    q = field(n)
+    print(f"N = {n}^3, K = {K_BINS}: {q.nbytes / 2**20:.0f} MiB of int32 on {device_properties()['name']}"
+          + (f"; {note}" if note else ""))
+    return n, K_BINS
 
 
 def save_sizing():
     """Measure the device's copy bandwidth and fix this machine's problem sizes, both in machine.json with the device's facts.
 
-    Notebook 90 settles them once, so every rung sweeps the same sizes and sets
-    its figures against the same roof. A stage whose memory budget excludes a
-    size skips it and names it."""
+    Notebook 90 settles them once, so every rung sweeps the same sizes and sets its figures against the same roof.
+    A stage whose memory budget excludes a size skips it and names it."""
     record = dict(load_machine())
     record["gpu_copy_gbs"] = measure_copy_bandwidth_gbs()
     print(f"  device copy bandwidth      {record['gpu_copy_gbs']:.0f} GB/s (read + write)")
     props = device_properties()
-    dev = props.get("total_bytes")
+    dev = props["total_bytes"]
     record["sweep"] = list(_derive_sweep())
     record["canonical"] = _canonical(record["sweep"], dev)
     record.update({f"device_{k}": v for k, v in props.items()})
-    if dev:
-        record["device_bytes"] = dev
+    record["device_bytes"] = dev
     MACHINE_PATH.write_text(json.dumps(record, indent=2))
     print(f"  canonical                  N = {record['canonical']}^3")
     print("  sweep                      " + ", ".join(f"{n}^3" for n in record["sweep"]))
     dropped = [n for n in SWEEP_N if n not in record["sweep"]]
     if dropped:
-        need = ", ".join(f"{n ** 3 * _stage_budget('generate') / 2 ** 30:.0f} GiB" for n in dropped)
+        per_voxel = DEVICE_BYTES_PER_VOXEL["generate"]
+        need = ", ".join(f"{n ** 3 * per_voxel / 2 ** 30:.0f} GiB" for n in dropped)
         print(f"  dropped                    {', '.join(f'{n}^3' for n in dropped)}: generating the field needs "
-              f"{_stage_budget('generate')} B/voxel on the device ({need}); this device has "
-              f"{to_mib(dev or 0) / 1024:.0f} GiB")
+              f"{per_voxel} B/voxel on the device ({need}); this device has {dev / 2**30:.0f} GiB")
     for stage in MAIN_STAGES:
         skipped = [n for n in record["sweep"] if n not in _affordable(stage, record["sweep"], dev)]
         if skipped:
-            print(f"  {stage:<26} skips {', '.join(f'{n}^3' for n in skipped)}: {_stage_budget(stage)} B/voxel")
+            print(f"  {stage:<26} skips {', '.join(f'{n}^3' for n in skipped)}: {DEVICE_BYTES_PER_VOXEL[stage]} B/voxel")
 
 
 def load_machine():
@@ -991,13 +696,8 @@ def copy_roof_gbs():
     """The device copy bandwidth the intro measured, from machine.json; names the intro when it is missing."""
     gbs = load_machine().get("gpu_copy_gbs")
     if not gbs:
-        raise RuntimeError("no copy bandwidth in machine.json: run 90__cosmic_web__intro.ipynb first")
+        raise RuntimeError(f"no copy bandwidth in machine.json: {RUN_INTRO_FIRST}")
     return gbs
-
-
-def to_mib(nbytes):
-    """Bytes -> binary MiB (2**20 bytes)."""
-    return nbytes / 2**20
 
 
 def by_size(build):
@@ -1013,41 +713,12 @@ def by_size(build):
             cache[n] = build(n)
         return cache[n]
 
-    get.cache = cache
     context = inspect.getframeinfo(inspect.currentframe().f_back, context=1).code_context
     get.source = context[0].strip() if context else ""
     return get
 
 
-def field(n):
-    """The binned field at size n, int32 on the device, built once per size so that no timed call pays for it."""
-    return make_binned_field(n)[0]
-
-
 # --- Experimental setup reports  --------------------------------------------------
-
-def physical_cores():
-    """Physical cores available in this process's CPU-affinity mask."""
-    affinity = cpu_affinity()
-    physical = set()
-    for cpu in affinity:
-        topology = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology")
-        try:
-            package = (topology / "physical_package_id").read_text().strip()
-            core = (topology / "core_id").read_text().strip()
-        except OSError:
-            return len(affinity)
-        physical.add((package, core))
-    return len(physical) or len(affinity)
-
-
-def cpu_affinity():
-    """Logical CPUs available to this process under the host or scheduler."""
-    try:
-        return os.sched_getaffinity(0)
-    except AttributeError:
-        return set(range(os.cpu_count() or 1))
-
 
 def machine_report():
     """Document the measurement environment: software versions, CPU/GPU identity, clock state."""
@@ -1060,22 +731,15 @@ def machine_report():
             platform.machine())
     except OSError:
         info["cpu"] = platform.machine()
-    info["cpus_available_physical_logical"] = f"{physical_cores()}/{len(cpu_affinity())}"
-    try:
-        info["cpu_governor"] = open(
-            "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor").read().strip()
-    except OSError:
-        pass
     for mod in ("scipy", "cupy", "jax"):
         try:
             info[mod] = __import__(mod).__version__
         except Exception:
             pass
     props = device_properties()
-    if props:
-        info["gpu_memory"] = f"{props['total_bytes'] / 2**30:.0f} GiB"
-        info["gpu_l2_cache"] = f"{props['l2_bytes'] / 2**20:.0f} MiB"
-        info["gpu_sms"] = f"{props['sms']} SMs x {props['threads_per_sm']} threads = {props['sms'] * props['threads_per_sm']} resident threads"
+    info["gpu_memory"] = f"{props['total_bytes'] / 2**30:.0f} GiB"
+    info["gpu_l2_cache"] = f"{props['l2_bytes'] / 2**20:.0f} MiB"
+    info["gpu_sms"] = f"{props['sms']} SMs x {props['threads_per_sm']} threads = {props['sms'] * props['threads_per_sm']} resident threads"
     try:
         q = subprocess.run(
             ["nvidia-smi", "--query-gpu=name,driver_version,memory.total,"
@@ -1093,9 +757,10 @@ def machine_report():
     return info
 
 
-def measure_copy_bandwidth_gbs(nbytes=1 << 30, repeats=10):
-    """Device-to-device copy bandwidth in GB/s (read + write counted), the roof every GPU figure uses."""
+def measure_copy_bandwidth_gbs():
+    """Device-to-device copy bandwidth in GB/s (read + write counted) of a one GiB copy, the roof every GPU figure uses."""
     import cupy as cp
+    nbytes, repeats = 1 << 30, 10
     src = cp.ones(nbytes, dtype=cp.uint8)
     dst = cp.empty_like(src)
     start, stop = cp.cuda.Event(), cp.cuda.Event()
@@ -1108,24 +773,8 @@ def measure_copy_bandwidth_gbs(nbytes=1 << 30, repeats=10):
         if i >= 2:
             times.append(cp.cuda.get_elapsed_time(start, stop) * 1e-3)
     del src, dst
-    cp.get_default_memory_pool().free_all_blocks()
+    release_pool()
     return float(2.0 * nbytes / np.median(times) / 1e9)
-
-
-# --- Compiler views -------------------------------------------------------------
-
-def jaxpr_summary(jaxpr):
-    """(number of lines, sorted primitive names) of a jaxpr."""
-    lines = str(jaxpr).splitlines()
-    rhs = [ln.split(" = ", 1)[1] for ln in lines if " = " in ln]
-    primitives = sorted({r.split("[")[0].split()[0] for r in rhs if not r.startswith("{")})
-    return len(lines), primitives
-
-
-def hlo_summary(text):
-    """(fusions, scatters) in a compiled module's optimised HLO text; each fusion is one kernel."""
-    import re
-    return len(re.findall(r", kind=k", text)), len(re.findall(r"\bscatter\(", text))
 
 
 # --- Nsight Compute ---------------------------------------------------------------
@@ -1147,29 +796,17 @@ NCU_METRICS = {
     "smsp__inst_executed.sum":                                          "instructions issued (warp level)",
     "smsp__issue_active.avg.pct_of_peak_sustained_active":              "issue slots used (%)",
 }
+NCU_EXTRA = ["lts__t_sectors_op_red.sum"]   # not in `--set full`; requested by name
 
 
-# The metrics of NCU_METRICS that `--set full` collects on its own; the others are requested by name.
-NCU_FULL_SET = {k for k in NCU_METRICS if k != "lts__t_sectors_op_red.sum"}
-
-
-def ncu_profile(probe_cmd, kernel_regex=None, save_csv=None):
-    """Profile one captured kernel with Nsight Compute and return its raw metrics as {name: (value, unit)}.
-
-    `probe_cmd` is the probe's argument list (interpreter first) and must bracket one launch with
-    cudaProfilerStart/Stop. The full metric set plus the named extras is collected and comes back as
-    csv on stdout. `save_csv` keeps a copy."""
+def ncu_profile(probe_cmd):
+    """Profile the one launch `probe_cmd` brackets with cudaProfilerStart/Stop; returns its raw metrics as {name: (value, unit)}."""
     import csv, io, subprocess
-    extra = [k for k in NCU_METRICS if k not in NCU_FULL_SET]
-    cmd = ["ncu", "--profile-from-start", "off", "--set", "full", "--metrics", ",".join(extra), "--csv", "--page", "raw"]
-    if kernel_regex:
-        cmd += ["-k", f"regex:{kernel_regex}"]
+    cmd = ["ncu", "--profile-from-start", "off", "--set", "full", "--metrics", ",".join(NCU_EXTRA), "--csv", "--page", "raw"]
     r = subprocess.run([str(c) for c in cmd + list(probe_cmd)], capture_output=True, text=True)
     lines = [ln for ln in r.stdout.splitlines() if ln.startswith('"')]
     if r.returncode != 0 or not lines:
         raise RuntimeError(f"ncu produced no table (exit {r.returncode}):\n{(r.stdout + r.stderr)[-2000:]}")
-    if save_csv:
-        Path(save_csv).write_text("\n".join(lines) + "\n")
     rows = list(csv.DictReader(io.StringIO("\n".join(lines))))
     units = rows[0] if rows and rows[0].get("ID", "").strip() == "" else {}
     data = rows[1:] if units else rows
@@ -1184,42 +821,33 @@ def ncu_profile(probe_cmd, kernel_regex=None, save_csv=None):
     return out
 
 
-def ncu_stalls(metrics, top=5):
-    """The warp stall reasons with the most warps stalled per issue-active cycle: [(reason, warps)]."""
-    prefix, suffix = "smsp__average_warps_issue_stalled_", "_per_issue_active.ratio"
-    stalls = [(k[len(prefix):-len(suffix)], v[0]) for k, v in metrics.items()
-              if k.startswith(prefix) and k.endswith(suffix) and isinstance(v[0], float)]
-    stalls = [(name, value) for name, value in stalls if name not in ("selected", "not_selected")]
-    return sorted(stalls, key=lambda kv: -kv[1])[:top]
-
-
-def print_ncu(metrics, names=NCU_METRICS):
-    """Print the metrics in `names` and the top stall reasons."""
-    for key, label in names.items():
-        if key in metrics:
-            value, unit = metrics[key]
-            value = f"{value:,.0f}" if isinstance(value, float) and abs(value) >= 1000 else (f"{value:.2f}" if isinstance(value, float) else value)
-            print(f"  {label:<52} {value:>14} {unit}")
-    print("  warps stalled per issue-active cycle, top reasons: " + ", ".join(f"{k} {v:.2f}" for k, v in ncu_stalls(metrics)))
-
-
 def ncu_report(stage, n, title, run=None, functions=(), args=(), state=(), header=""):
-    """Profile one launch of the stage's probe with Nsight Compute and print the metrics under `title`.
+    """Profile one launch of the stage's probe with Nsight Compute; print the metrics of NCU_METRICS and the top stall reasons under `title`.
 
     With `run`, the probe is written first, as `trace_call` writes it."""
     import sys
     if run is not None:
         write_probe(stage, run, functions, args, state, header)
     print(title)
-    print_ncu(ncu_profile([sys.executable, probe_path(stage), str(n)]))
+    metrics = ncu_profile([sys.executable, f"cosmic_probe_{stage}.py", str(n)])
+    for key, label in NCU_METRICS.items():
+        if key in metrics:
+            value, unit = metrics[key]
+            value = f"{value:,.0f}" if isinstance(value, float) and abs(value) >= 1000 else (f"{value:.2f}" if isinstance(value, float) else value)
+            print(f"  {label:<52} {value:>14} {unit}")
+    prefix, suffix = "smsp__average_warps_issue_stalled_", "_per_issue_active.ratio"
+    stalls = sorted(((k[len(prefix):-len(suffix)], v[0]) for k, v in metrics.items()
+                     if k.startswith(prefix) and k.endswith(suffix) and isinstance(v[0], float)
+                     and not k[len(prefix):-len(suffix)].endswith("selected")), key=lambda kv: -kv[1])[:5]
+    print("  warps stalled per issue-active cycle, top reasons: " + ", ".join(f"{k} {v:.2f}" for k, v in stalls))
 
 
-# --- Profiler report parsing ----------------------------------------------------
+# --- Profiler probes and Nsight Systems ----------------------------------------------
 
-def run_probe(cmd, cwd=None):
+def run_probe(cmd):
     """Run a probe script and return (stdout, wall_s); raises with the output's tail when no WALL_S line appears."""
     import subprocess
-    r = subprocess.run([str(c) for c in cmd], cwd=cwd, capture_output=True, text=True)
+    r = subprocess.run([str(c) for c in cmd], capture_output=True, text=True)
     wall = next((float(ln.split()[1]) for ln in r.stdout.splitlines() if ln.startswith("WALL_S")), None)
     if r.returncode != 0 or wall is None:
         output = r.stdout + "\n" + r.stderr
@@ -1232,25 +860,20 @@ def run_probe(cmd, cwd=None):
     return r.stdout, wall
 
 
-def nsys_stats_rows(report, name, marker):
-    """Rows (dicts) of one `nsys stats --report <name>` table, located by a column name in its header."""
+def nsys_trace_rows(report):
+    """[(start_s, duration_s, name, kind)] for every GPU operation of an nsys report, kind in kernel / memcpy / memset."""
     import csv, io, subprocess
-    out = subprocess.run(["nsys", "stats", "--force-export=true", "--report", name,
+    out = subprocess.run(["nsys", "stats", "--force-export=true", "--report", "cuda_gpu_trace",
                           "--format", "csv", str(report)], capture_output=True, text=True)
     if out.returncode != 0:
-        raise RuntimeError(f"nsys stats --report {name} failed on {report}:\n{out.stderr[-2000:]}")
+        raise RuntimeError(f"nsys stats --report cuda_gpu_trace failed on {report}:\n{out.stderr[-2000:]}")
     lines = out.stdout.splitlines()
-    start = next((i for i, ln in enumerate(lines) if marker in ln), None)
+    start = next((i for i, ln in enumerate(lines) if "Start (ns)" in ln), None)
     if start is None:
-        raise RuntimeError(f"no '{marker}' column in nsys stats --report {name} for {report}")
+        raise RuntimeError(f"no 'Start (ns)' column in nsys stats --report cuda_gpu_trace for {report}")
     table = "\n".join(ln for ln in lines[start:] if ln.strip())
-    return list(csv.DictReader(io.StringIO(table)))
-
-
-def nsys_trace_rows(report):
-    """[(start_s, duration_s, name, kind)] for every GPU operation, kind in kernel / memcpy / memset."""
     rows = []
-    for r in nsys_stats_rows(report, "cuda_gpu_trace", "Start (ns)"):
+    for r in csv.DictReader(io.StringIO(table)):
         name = r.get("Name", "")
         low = name.lower()
         kind = "memcpy" if "memcpy" in low else "memset" if "memset" in low else "kernel"
@@ -1290,25 +913,26 @@ print(f"HIST_SUM {{int(hist.sum())}}")
 NSYS_PROFILE = ["nsys", "profile", "-c", "cudaProfilerApi", "--capture-range-end=stop", "--cuda-graph-trace=node",
                 "--force-overwrite", "true"]
 
-
-def probe_path(stage):
-    """cosmic_probe_<stage>.py, the stage's profiler script."""
-    return f"cosmic_probe_{stage}.py"
+# The probe prelude of the JAX stages: the same environment and imports as the notebook's first cell.
+JAX_PROBE = dict(header='''
+import os
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+from functools import partial
+import jax
+import jax.numpy as jnp
+''')
 
 
 def write_probe(stage, run, functions=(), args=(), state=(), header=""):
-    """Write the stage's self-contained profiler script and return its path.
+    """Write cosmic_probe_<stage>.py, the stage's self-contained profiler script, and return its path.
 
-    The script imports NumPy, CuPy and this module as `cw`, runs `header`, the source of `functions` and `run`, then
-    the `state` lines, and calls `run(n, *args)` once warm and once profiled. `n` is the command-line argument and `K`
-    the module's. A `state` entry is a line of code, or a `by_size` getter whose defining line is copied. A name that
-    a default argument needs goes in `header`, which runs before the sources.
-    """
+    The script runs `header`, the source of `functions` and `run`, then the `state` lines (a line of code, or a
+    `by_size` getter whose defining line is copied), and calls `run(n, *args)` once warm and once profiled."""
     import inspect
     impl = "\n\n".join(inspect.getsource(inspect.unwrap(f)) for f in (*functions, run))
     lines = [state] if isinstance(state, str) else [x if isinstance(x, str) else x.source for x in state]
     call = f"{run.__name__}({', '.join(['n', *map(repr, args)])})"
-    path = probe_path(stage)
+    path = f"cosmic_probe_{stage}.py"
     Path(path).write_text(PROBE_TEMPLATE.format(stage=stage, header=header, impl=impl, state="\n".join(lines), call=call))
     return path
 
@@ -1316,8 +940,7 @@ def write_probe(stage, run, functions=(), args=(), state=(), header=""):
 def trace_call(stage, run, n, functions=(), args=(), state=(), header=""):
     """Write the stage's probe, trace one call with Nsight Systems, print what the GPU did and attach it to the stage file.
 
-    Returns {"kernels", "memcpy", "memset", "wall_s", "gpu_busy_s", "rows"}. The report is launch_<stage>.nsys-rep.
-    """
+    Returns {"kernels", "memcpy", "memset", "wall_s", "gpu_busy_s", "rows"}. The report is launch_<stage>.nsys-rep."""
     import sys
     probe = write_probe(stage, run, functions, args, state, header)
     _, wall_s = run_probe(NSYS_PROFILE + ["-o", f"launch_{stage}", sys.executable, probe, str(n)])
@@ -1326,33 +949,28 @@ def trace_call(stage, run, n, functions=(), args=(), state=(), header=""):
     gpu_busy_s = sum(d for _, d, _, _ in rows)
     print(f"one call at N = {n}^3: {counts['kernel']} kernels, {counts['memcpy']} memcpys, {counts['memset']} memsets; "
           f"GPU busy {gpu_busy_s * 1e3:.2f} ms of {wall_s * 1e3:.2f} ms wall")
-    save_launches(stage, counts["kernel"], n, memcpy=counts["memcpy"], memset=counts["memset"],
-                  wall_s=wall_s, gpu_busy_s=gpu_busy_s)
-    save_trace(stage, rows)
+    _attach(stage, "launches", {"n": n, "kernels": counts["kernel"], "memcpy": counts["memcpy"],
+                                "memset": counts["memset"], "wall_s": wall_s, "gpu_busy_s": gpu_busy_s})
+    _attach(stage, "trace", [list(r) for r in rows])
     return {"kernels": counts["kernel"], "memcpy": counts["memcpy"], "memset": counts["memset"],
             "wall_s": wall_s, "gpu_busy_s": gpu_busy_s, "rows": rows}
 
 
-def kernel_names(rows):
-    """The distinct kernel names in trace rows, template arguments and namespaces stripped, sorted."""
-    return sorted({name.split("<")[0].rsplit("::", 1)[-1] for _, _, name, kind in rows if kind == "kernel"})
+# --- Kernel sources ------------------------------------------------------------------
 
-
-def ecc_cuda_source(body=None):
+def ecc_cuda_source(body):
     """cosmic_ecc.cu as a string, with `body` spliced between the BEGIN BODY and END BODY markers."""
     src = ECC_CUDA_CU.read_text()
-    assert f"constexpr int K_BINS = {K_BINS};" in src, "cosmic_ecc.cu and cosmic_core.K_BINS disagree"
-    if body is None:
-        return src
+    if f"constexpr int K_BINS = {K_BINS};" not in src:
+        raise RuntimeError("cosmic_ecc.cu and cosmic_core.K_BINS disagree")
     begin, end = "        // BEGIN BODY\n", "        // END BODY\n"
     head, rest = src.split(begin, 1)
     _, tail = rest.split(end, 1)
-    body = body.strip("\n") + "\n"
-    return head + begin + body + end + tail
+    return head + begin + body.strip("\n") + "\n" + end + tail
 
 
 def ecc_cuda_variants_source():
-    """cosmic_ecc_variants.cu as a string: the rows kernel (3-D grid, several voxels per thread) and the slab kernel."""
+    """cosmic_ecc_variants.cu as a string: the rows kernel, the same body on a 3D grid with several voxels per thread."""
     return ECC_VARIANTS_CU.read_text()
 
 
@@ -1361,19 +979,16 @@ def cub_histogram_source():
     return CUB_HIST_CU.read_text()
 
 
-# --- Data: the real cube and its fallback -------------------------------------------
+# --- Data: the real cube and its stand-in -------------------------------------------
 
-def load_density_cube(path=None, r_voxels=R_SMOOTH_VOXELS):
-    """(ν, λ, label) from a real density cube, or None with an explanation when none is present.
+def load_density_cube():
+    """(ν, λ, label) from the Quijote cube under data/ or $COSMIC_WEB_DATA, or None with an explanation when it is absent.
 
-    Looks at `path`, then data/<QUIJOTE_FILE>, then $COSMIC_WEB_DATA/<QUIJOTE_FILE>.
     The array convention (δ, 1+δ or ρ) is read off the mean."""
-    candidates = [Path(path)] if path else [
-        DATA_DIR / QUIJOTE_FILE,
-        Path(os.environ.get("COSMIC_WEB_DATA", "")) / QUIJOTE_FILE]
+    candidates = [DATA_DIR / QUIJOTE_FILE, Path(os.environ.get("COSMIC_WEB_DATA", "")) / QUIJOTE_FILE]
     found = next((p for p in candidates if p.is_file()), None)
     if found is None:
-        print(f"no real density cube found (data/{QUIJOTE_FILE} or $COSMIC_WEB_DATA): using the Zel'dovich fallback")
+        print(f"no real density cube found (data/{QUIJOTE_FILE} or $COSMIC_WEB_DATA): using the Zel'dovich stand-in")
         print(f"  the Quijote fiducial 256^3 CIC cube at z = 0 ({QUIJOTE_CITATION}) is distributed through Globus;")
         print("  place it under data/ or point COSMIC_WEB_DATA at its directory to use it here")
         return None
@@ -1385,9 +1000,9 @@ def load_density_cube(path=None, r_voxels=R_SMOOTH_VOXELS):
         convention, delta = "1+delta", arr - mean
     else:
         convention, delta = "rho", arr / mean - 1.0
-    nu, lam = standardise(*smooth_k(delta, r_voxels))
+    nu, lam = standardise(*smooth_k(delta))
     label = (f"Quijote fiducial {arr.shape[0]}^3 CIC at z = 0, {convention} in {found.name} "
-             f"({QUIJOTE_CITATION}); R = {r_voxels:g} voxels")
+             f"({QUIJOTE_CITATION}); R = {R_SMOOTH_VOXELS:g} voxels")
     print(label)
     return nu, lam, label
 
@@ -1401,15 +1016,15 @@ def _tophat_k(x):
     return out
 
 
-def zeldovich_displacement(n, seed=SEED, box_mpc=BOX_MPC, sigma8=0.834):
-    """Linear Zel'dovich displacement field ψ (three n³ arrays, voxel units) for δ normalised to σ₈."""
+def zeldovich_displacement(n, box_mpc=BOX_MPC):
+    """Linear Zel'dovich displacement field ψ (three n³ arrays, voxel units) for δ normalised to SIGMA8."""
     from scipy import fft
-    delta_hat = fft.rfftn(gaussian_field(n, seed, box_mpc), workers=-1)
+    delta_hat = fft.rfftn(gaussian_field(n, SEED, box_mpc), workers=-1)
     k2_phys = kgrid(n) * (n / box_mpc) ** 2
     w = rfft_weights(n)[None, None, :]
     var8 = float((w * (delta_hat.real ** 2 + delta_hat.imag ** 2)
                   * _tophat_k(np.sqrt(k2_phys) * 8.0) ** 2).sum()) / n ** 6
-    delta_hat *= sigma8 / np.sqrt(var8)
+    delta_hat *= SIGMA8 / np.sqrt(var8)
     with np.errstate(divide="ignore", invalid="ignore"):
         inv_k2 = np.where(k2_phys > 0, 1.0 / k2_phys, 0.0)
     cell = box_mpc / n
@@ -1443,27 +1058,19 @@ def cic_deposit(positions, n):
     return rho.reshape(n, n, n)
 
 
-def zeldovich_delta(psi, growth):
+def zeldovich_delta(n, growth, box_mpc=BOX_MPC):
     """Density contrast of grid particles displaced by growth · ψ, CIC-deposited."""
-    n = psi[0].shape[0]
+    psi = zeldovich_displacement(n, box_mpc)
     grid = np.indices((n, n, n), dtype=np.float64)
     return cic_deposit([grid[a] + growth * psi[a] for a in range(3)], n) - 1.0
 
 
-def zeldovich_cube(n=CANONICAL_N, seed=SEED, box_mpc=BOX_MPC, sigma8=0.834, growth=1.0,
-                   r_voxels=R_SMOOTH_VOXELS):
-    """(ν, λ) of a Zel'dovich-evolved field: linear δ at σ₈, displaced particles, CIC deposit, smoothing."""
-    delta = zeldovich_delta(zeldovich_displacement(n, seed, box_mpc, sigma8), growth)
-    return standardise(*smooth_k(delta, r_voxels))
-
-
-def zeldovich_particles(n=128, start=0.0, end=1.0, interval=0.1, seed=SEED, box_mpc=250.0, sigma8=0.834,
-                        plane=None):
-    """[(D, (x, y))]: the particles that started on one grid plane, seen from above, at D = start, start + interval, ..., end.
+def zeldovich_particles(n=128, start=0.0, end=1.0, interval=0.1):
+    """[(D, (x, y))]: the particles that started on the middle grid plane, seen from above, at D = start, start + interval, ..., end.
 
     The same particles are followed from frame to frame; positions wrap around the periodic box."""
-    psi = zeldovich_displacement(n, seed, box_mpc, sigma8)
-    plane = n // 2 if plane is None else plane
+    psi = zeldovich_displacement(n, DEMO_BOX_MPC)
+    plane = n // 2
     gx, gy = np.indices((n, n), dtype=np.float64)
     frames = []
     for d in np.linspace(start, end, int(round(abs(end - start) / interval)) + 1):
@@ -1485,36 +1092,49 @@ def load_dataset(n=CANONICAL_N):
         with np.load(path) as f:
             nu, lam = f["nu"], float(f["lam"])
     else:
-        nu, lam = zeldovich_cube(n)
+        nu, lam = standardise(*smooth_k(zeldovich_delta(n, growth=1.0)))
         np.savez(path, nu=nu, lam=lam)
-    label = (f"Zel'dovich fallback: N = {n}^3, box {BOX_MPC:.0f} Mpc/h, sigma8 0.834, "
+    label = (f"Zel'dovich stand-in: N = {n}^3, box {BOX_MPC:.0f} Mpc/h, sigma8 {SIGMA8}, "
              f"seed {SEED}, R = {R_SMOOTH_VOXELS:g} voxels")
     print(label)
     return nu, lam, label
 
 
-# --- Presentation helpers -----------------------------------------------------------
-#
-# Cosmetic utility functions that receive measurements or derived quantities.
+# --- Figures -----------------------------------------------------------------------
 
 _MARKERS = ("o-", "s-", "d-", "v-", "^-", "D-", "p-", "x-", "+-")
 _LAND = "#d9b36b"
+_KIND_COLOUR = {"kernel": "#27a", "memcpy": "#c33", "memset": "#e90"}
 
 
-def plot_slices(nu, thresholds, z=None, title=""):
-    """One slice of ν beside its superlevel masks at the given thresholds."""
+def plot_slices(nu, thresholds):
+    """The middle slice of ν beside its superlevel masks at the given thresholds."""
     import matplotlib.pyplot as plt
     nu = np.asarray(nu)
-    s = nu[:, :, nu.shape[2] // 2 if z is None else z]
+    s = nu[:, :, nu.shape[2] // 2]
     fig, axes = plt.subplots(1, 1 + len(thresholds), figsize=(3.6 * (1 + len(thresholds)), 3.8))
     axes[0].imshow(s, cmap="magma", vmin=-3, vmax=3, interpolation="nearest")
-    axes[0].set_title(title or "ν on one slice")
+    axes[0].set_title("ν on one slice")
     for ax, t in zip(axes[1:], thresholds):
         ax.imshow(s >= t, cmap="Greys_r", vmin=0, vmax=1, interpolation="nearest")
         ax.set_title(f"ν ≥ {t:g}")
     for ax in axes:
         ax.set_xticks([])
         ax.set_yticks([])
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_hist_curve(edges, hist, chi):
+    """The token histogram by birth bin beside χ(ν), its cumulative sum from the top."""
+    import matplotlib.pyplot as plt
+    fig, (left, right) = plt.subplots(1, 2, figsize=(11, 3.6))
+    left.bar(edges, hist, width=edges[1] - edges[0], color="#27a")
+    left.axhline(0, color="#888", lw=0.8)
+    left.set(xlabel="birth bin (ν)", ylabel="tokens", title="tokens sorted by birth")
+    right.step(edges, chi, where="post", color="#27a")
+    right.axhline(0, color="#888", lw=0.8)
+    right.set(xlabel="level ν", ylabel="χ", title="χ(ν): the tokens summed from the top")
     plt.tight_layout()
     plt.show()
 
@@ -1565,16 +1185,16 @@ def animate_particles(frames, n, frame_ms=500):
     return HTML(anim.to_jshtml())
 
 
-def plot_points_to_field(n=128, growth=1.0, seed=SEED, box_mpc=250.0, sigma8=0.834, r_voxels=1.5, plane=None):
-    """Four panels on one plane of the box at D = growth: the particles within half a cell of the plane, the mass per cell, the blurred contrast and ν."""
+def plot_points_to_field(n=128, growth=1.0, r_voxels=1.5):
+    """Four panels on the middle plane of the box at D = growth: the particles within half a cell of the plane, the mass per cell, the blurred contrast and ν."""
     import matplotlib.pyplot as plt
-    psi = zeldovich_displacement(n, seed, box_mpc, sigma8)
-    z = n // 2 if plane is None else plane
+    psi = zeldovich_displacement(n, DEMO_BOX_MPC)
+    z = n // 2
     grid = np.indices((n, n, n), dtype=np.float64)
     pos = [grid[a] + growth * psi[a] for a in range(3)]
     rho = cic_deposit(pos, n)
-    delta_s, sigma0_sq, _ = smooth_k(rho - 1.0, r_voxels)
-    nu = (delta_s - delta_s.mean()) / np.sqrt(sigma0_sq)
+    delta_s, sigma0_sq, sigma1_sq = smooth_k(rho - 1.0, r_voxels)
+    nu, _ = standardise(delta_s, sigma0_sq, sigma1_sq)
     near = np.abs(np.mod(pos[2] - z + n / 2, n) - n / 2) < 0.5
     fig, axes = plt.subplots(1, 4, figsize=(15.5, 4.2))
     axes[0].scatter(np.mod(pos[0][near], n), np.mod(pos[1][near], n), s=0.3, c="#123", lw=0)
@@ -1596,7 +1216,7 @@ def plot_points_to_field(n=128, growth=1.0, seed=SEED, box_mpc=250.0, sigma8=0.8
 
 
 def plot_birth_example(q2d, k):
-    """A small 2-D patch: every vertex, edge and face labelled with its birth bin, the ±1 tokens per bin, χ summed from the top."""
+    """A small 2D patch: every vertex, edge and face labelled with its birth bin, the ±1 tokens per bin, χ summed from the top."""
     import matplotlib.pyplot as plt
     from matplotlib.patches import Rectangle
     q = np.asarray(q2d)
@@ -1607,7 +1227,7 @@ def plot_birth_example(q2d, k):
     bc = lambda a: np.bincount(a.ravel(), minlength=k)
     born_v, born_e, born_f = bc(q), bc(e_down) + bc(e_right), bc(faces)
     hist = born_v - born_e + born_f
-    chi = np.cumsum(hist[::-1])[::-1]
+    chi = ecc_from_hist(hist)
     fig, (ax, axh, axc) = plt.subplots(1, 3, figsize=(14, 4.4), gridspec_kw={"width_ratios": [1.15, 1, 1]})
     for r in range(rows - 1):
         for c in range(cols - 1):
@@ -1687,7 +1307,7 @@ def animate_flood(slice2d, start=2.5, end=-2.5, interval=0.125, frame_ms=150):
 
 
 def animate_euler_buildup(mask, frame_ms=250):
-    """Vertices, then edges, then faces light up on a pixel mask while V, E, F and V − E + F tick."""
+    """Vertices, then edges, then faces are drawn on a pixel mask while V, E, F and V − E + F count up."""
     import matplotlib.pyplot as plt
     from matplotlib.animation import FuncAnimation
     from matplotlib.patches import Rectangle
@@ -1735,13 +1355,15 @@ def animate_euler_buildup(mask, frame_ms=250):
 
 def animate_birthdays(nu_small, k=16, frame_ms=700):
     """On a small cube, lower the level bin by bin: the cells born at each level, their ±1 tokens, the curve."""
+    import cupy as cp
     import matplotlib.pyplot as plt
     from matplotlib.animation import FuncAnimation
     from IPython.display import HTML
-    q = quantise(nu_small, k)
-    v, (ex, ey, ez), (fxy, fxz, fyz), c = _cell_births(q)
-    bc = lambda a: np.bincount(a.ravel(), minlength=k)
+    q = quantise(cp.asarray(nu_small), k)
+    v, (ex, ey, ez), (fxy, fxz, fyz), c = ecc_cells_cupy(q)
+    bc = lambda a: cp.asnumpy(cp.bincount(a.ravel(), minlength=k))
     born = {"V": bc(v), "E": bc(ex) + bc(ey) + bc(ez), "F": bc(fxy) + bc(fxz) + bc(fyz), "C": bc(c)}
+    q = cp.asnumpy(q)
     hist = born["V"] - born["E"] + born["F"] - born["C"]
     chi = ecc_from_hist(hist)
     edges = bin_edges(k)
@@ -1781,19 +1403,15 @@ def animate_birthdays(nu_small, k=16, frame_ms=700):
     return HTML(anim.to_jshtml())
 
 
-def isosurfaces(nu, thresholds, sub=64, step_size=1):
-    """Marching-cubes isosurfaces of a sub-cube at each threshold; prints one line and skips without scikit-image."""
-    try:
-        from skimage import measure
-    except ImportError:
-        print("scikit-image is not installed: the live isosurfaces need the SC26 image (scikit-image 0.26.0)")
-        return
+def isosurfaces(nu, thresholds, sub=64):
+    """Marching-cubes isosurfaces of a sub-cube at each threshold, through scikit-image."""
+    from skimage import measure
     import matplotlib.pyplot as plt
     vol = np.ascontiguousarray(np.asarray(nu)[:sub, :sub, :sub], dtype=np.float32)
     fig = plt.figure(figsize=(4.4 * len(thresholds), 4.4))
     for i, t in enumerate(thresholds, 1):
         ax = fig.add_subplot(1, len(thresholds), i, projection="3d")
-        verts, faces, _, _ = measure.marching_cubes(vol, level=float(t), step_size=step_size)
+        verts, faces, _, _ = measure.marching_cubes(vol, level=float(t))
         ax.plot_trisurf(verts[:, 0], verts[:, 1], verts[:, 2], triangles=faces,
                         color="#5a8", lw=0.05, alpha=0.95)
         ax.set_xlim(0, sub)
@@ -1822,7 +1440,7 @@ def plot_cold_warm(labels, cold_s, warm_s, title):
     plt.show()
 
 
-def plot_compile_share(stage, title, compile_label="compile (one-time)"):
+def plot_compile_share(stage, title, compile_label):
     """Stacked bars splitting the first call at every size of the stage's sweep into execution and one-time compile."""
     import matplotlib.pyplot as plt
     sweep = load_stage(stage)["sweep"]
@@ -1852,15 +1470,12 @@ def plot_compile_share(stage, title, compile_label="compile (one-time)"):
     plt.show()
 
 
-_KIND_COLOUR = {"kernel": "#27a", "memcpy": "#c33", "memset": "#e90"}
-
-
 def plot_curves_with_delta(edges, curves, reference, title=""):
     """Every tool's χ(ν) over the reference, with each tool's difference to it in a strip underneath."""
     import matplotlib.pyplot as plt
     fig, (top, bottom) = plt.subplots(2, 1, figsize=(7.5, 5.5), sharex=True,
                                       gridspec_kw={"height_ratios": [3, 1]})
-    top.plot(edges, reference, "--", color="#444", lw=1.5, label="NumPy reference")
+    top.plot(edges, reference, "--", color="#444", lw=1.5, label="CuPy reference")
     for (name, chi), marker in zip(curves.items(), _MARKERS):
         top.plot(edges, chi, marker[0], ms=4, alpha=0.8, label=name)
         bottom.plot(edges, np.asarray(chi, dtype=np.int64) - np.asarray(reference, dtype=np.int64),
@@ -1925,10 +1540,8 @@ def plot_breakdown(parts, title=""):
     plt.show()
 
 
-def plot_bytes_roof(sweeps, tools, gbs, k=K_BINS, title=""):
-    """Time per call against N per tool, with each tool's bytes model at `gbs` GB/s dashed in the same colour.
-
-    `sweeps`: {label: sweep points}; `tools`: {label: the tool name `bytes_model` knows}."""
+def plot_bytes_roof(sweeps, tools, gbs, title=""):
+    """Time per call against N per tool ({label: sweep points}), with the bytes model of {label: tool} at `gbs` GB/s dashed."""
     import matplotlib.pyplot as plt
     fig, ax = plt.subplots(figsize=(7.5, 4.5))
     colours = ("#27a", "#c33", "#5a8", "#e90", "#80c", "#444")
@@ -1936,7 +1549,7 @@ def plot_bytes_roof(sweeps, tools, gbs, k=K_BINS, title=""):
         ns = [p["n"] for p in points]
         ax.plot(ns, [p["median_s"] * 1e3 for p in points], "o-", color=colour, label=name)
         if name in tools:
-            roof = [roof_time_s(bytes_model(tools[name], n, k), gbs) * 1e3 for n in ns]
+            roof = [bytes_model(tools[name], n) / (gbs * 1e9) * 1e3 for n in ns]
             ax.plot(ns, roof, "--", color=colour, lw=1, alpha=0.8)
     ax.set_xscale("log", base=2)
     ax.set_yscale("log")
@@ -1949,26 +1562,3 @@ def plot_bytes_roof(sweeps, tools, gbs, k=K_BINS, title=""):
     ax.grid(alpha=0.3, which="both")
     plt.tight_layout()
     plt.show()
-
-
-# --- Self-test ------------------------------------------------------------------
-
-def smoke(n=32):
-    """Run the small-grid checks and a Gaussian-field sanity check at a small size."""
-    check_small_grids()
-    nu, lam = make_nu_field(n)
-    q = quantise(nu)
-    hist = ecc_hist_numpy(q)
-    assert int(hist.sum()) == 0, f"histogram sums to {int(hist.sum())}, not 0"
-    if _cupy_available():
-        import cupy as cp
-        assert np.array_equal(cp.asnumpy(ecc_hist_cupy(cp.asarray(q))), hist), "the CuPy reference differs from NumPy"
-    chi = ecc_from_hist(hist)
-    pred = chi_gaussian(bin_edges(), lam, q.size)
-    rel, zeros = overlay_residual(bin_edges(), chi, pred)
-    print(f"cosmic_core OK  (N={n}, Σhist=0, λ={lam:.4f}, λ_fd={lambda_finite_difference(nu):.4f}, "
-          f"max|χ|={int(np.abs(chi).max())}, rel. residual {rel:.3f}, zero crossings {np.round(zeros, 2).tolist()})")
-
-
-if __name__ == "__main__":
-    smoke()

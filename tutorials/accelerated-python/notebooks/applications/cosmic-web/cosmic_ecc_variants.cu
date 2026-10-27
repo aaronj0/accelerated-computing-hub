@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-// One variant of the count for the CppJIT notebook's extra credit: the same stencil
-// and the same shared-memory histogram as cosmic_ecc.cu, with a different thread mapping.
-//
-// ecc_hist_rows_kernel: the grid is (gridDim.x, n, n), so blockIdx.y and blockIdx.z
-// carry j and i and no thread divides to find its voxel; each thread strides along k
-// and counts several voxels.
+// The stencil and the shared histogram of cosmic_ecc.cu on a 3D grid (gridDim.x, n, n): blockIdx.y and
+// blockIdx.z carry j and i, so no thread divides to find its voxel, and each thread strides along k.
+// The names end in V because both units live in one session, where a name is defined once.
 
 #include <cuda_runtime.h>
 
