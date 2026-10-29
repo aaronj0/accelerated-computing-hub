@@ -829,7 +829,7 @@ def ncu_report(stage, n, title, run=None, functions=(), args=(), state=(), heade
     if run is not None:
         write_probe(stage, run, functions, args, state, header)
     print(title)
-    metrics = ncu_profile([sys.executable, f"cosmic_probe_{stage}.py", str(n)])
+    metrics = ncu_profile([sys.executable, f"nsys_probe_{stage}.py", str(n)])
     for key, label in NCU_METRICS.items():
         if key in metrics:
             value, unit = metrics[key]
@@ -924,7 +924,7 @@ import jax.numpy as jnp
 
 
 def write_probe(stage, run, functions=(), args=(), state=(), header=""):
-    """Write cosmic_probe_<stage>.py, the stage's self-contained profiler script, and return its path.
+    """Write nsys_probe_<stage>.py, the stage's self-contained profiler script, and return its path.
 
     The script runs `header`, the source of `functions` and `run`, then the `state` lines (a line of code, or a
     `by_size` getter whose defining line is copied), and calls `run(n, *args)` once warm and once profiled."""
@@ -932,7 +932,7 @@ def write_probe(stage, run, functions=(), args=(), state=(), header=""):
     impl = "\n\n".join(inspect.getsource(inspect.unwrap(f)) for f in (*functions, run))
     lines = [state] if isinstance(state, str) else [x if isinstance(x, str) else x.source for x in state]
     call = f"{run.__name__}({', '.join(['n', *map(repr, args)])})"
-    path = f"cosmic_probe_{stage}.py"
+    path = f"nsys_probe_{stage}.py"
     Path(path).write_text(PROBE_TEMPLATE.format(stage=stage, header=header, impl=impl, state="\n".join(lines), call=call))
     return path
 
@@ -947,8 +947,7 @@ def trace_call(stage, run, n, functions=(), args=(), state=(), header=""):
     rows = nsys_trace_rows(f"launch_{stage}.nsys-rep")
     counts = {kind: sum(1 for *_, kk in rows if kk == kind) for kind in ("kernel", "memcpy", "memset")}
     gpu_busy_s = sum(d for _, d, _, _ in rows)
-    print(f"one call at N = {n}^3: {counts['kernel']} kernels, {counts['memcpy']} memcpys, {counts['memset']} memsets; "
-          f"GPU busy {gpu_busy_s * 1e3:.2f} ms of {wall_s * 1e3:.2f} ms wall")
+    print(f"one call at N = {n}^3: {counts['kernel']} kernels, {counts['memcpy']} memcpys, {counts['memset']} memsets")
     _attach(stage, "launches", {"n": n, "kernels": counts["kernel"], "memcpy": counts["memcpy"],
                                 "memset": counts["memset"], "wall_s": wall_s, "gpu_busy_s": gpu_busy_s})
     _attach(stage, "trace", [list(r) for r in rows])
