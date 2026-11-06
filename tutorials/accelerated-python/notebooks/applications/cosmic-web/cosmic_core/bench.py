@@ -192,7 +192,7 @@ def load_stages(stages, extras=()):
     """The records of `stages` and `extras` for the synthesis, after its checks.
 
     Stops when machine.json or the `cupy` record is missing, or the records are at different sizes. A missing stage
-    is named with its notebook and a missing extra is skipped; a record without its sweep or trace is named too."""
+    is named with its notebook, and so is a stage without its sweep or trace; a missing extra is skipped."""
     machine = load_machine()
     if not machine.get("device_name"):
         raise RuntimeError(f"no machine.json: {RUN_INTRO_FIRST}")
@@ -204,8 +204,10 @@ def load_stages(stages, extras=()):
         if s not in by_stage:
             print(f"stage {s!r} not recorded: run {STAGE_NOTEBOOK.get(s, s)} to add it")
     present = {s: by_stage[s] for s in (*stages, *extras) if s in by_stage}
-    for s, r in present.items():
-        missing = [k for k in ("sweep", "trace") if k not in r]
+    for s in stages:
+        if s not in present:
+            continue
+        missing = [k for k in ("sweep", "trace") if k not in present[s]]
         if missing:
             print(f"stage {s!r} has no {' or '.join(missing)}: rerun {STAGE_NOTEBOOK.get(s, s)} top to bottom")
     sizes = {r["n"] for r in present.values()}
