@@ -7,7 +7,8 @@ Every notebook imports the package as `cw`. The algorithm and its physics are ex
 config     constants and paths
 device     device properties, free memory, the CuPy memory pool, the copy bandwidth
 testfield  the Gaussian test field: spectrum, generation on the device, binning, cache
-dataset    the density cube of notebooks 90 and 95: Quijote when its file is present, otherwise the Zel'dovich stand-in
+dataset    the Zel'dovich stand-in of notebook 90: the particle pictures and the density field of its first sections
+quijote    the Quijote cube: the particle positions, the CIC deposit on the device, the density field of 90 to 95
 ecc        the reference histogram, the Euler characteristic curve, the exact check, the Gaussian expectation
 sizing     the memory budget of each stage, machine.json, the benchmark and sweep sizes, the copy bandwidth
 bench      the first call and the median, sweeps, stage files, memory-traffic estimates
@@ -25,7 +26,8 @@ del os
 
 from .config import K_BINS
 from .testfield import bin_edges, quantise, make_binned_field, field
-from .dataset import load_dataset, zeldovich_particles
+from .dataset import zeldovich_field, zeldovich_particles
+from .quijote import quijote_field, quijote_positions, cic_density_device
 from .ecc import ecc_cells_cupy, ecc_hist_cupy, ecc_from_hist, chi_reference, chi_gaussian, zero_crossings, ANALYTIC_TOL
 from .sizing import setup, save_sizing, benchmark_n, copy_gbs, machine_report
 from .bench import (measure, save_sweep, by_size, load_stages, stage_table, wall_breakdown, sweep_series,

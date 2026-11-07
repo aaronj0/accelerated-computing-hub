@@ -5,7 +5,7 @@ import numpy as np
 
 from .config import K_BINS
 from .device import release_pool
-from .testfield import field, cache_path
+from .testfield import field, field_cache_path
 
 
 def ecc_cells_cupy(q):
@@ -39,9 +39,9 @@ def ecc_from_hist(hist):
 
 
 def chi_reference(n):
-    """The reference curve of the test field at size n, computed once and cached under data/."""
+    """The reference curve of `field(n)`, computed once and cached under data/."""
     import cupy as cp
-    path = cache_path("chi", n, ".npy")
+    path = field_cache_path("chi", n, ".npy")
     if path.exists():
         return np.load(path)
     chi = ecc_from_hist(cp.asnumpy(ecc_hist_cupy(field(n))))

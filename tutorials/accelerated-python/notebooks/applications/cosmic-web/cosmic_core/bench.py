@@ -12,7 +12,7 @@ import numpy as np
 from .config import (K_BINS, WARMUP, REPEATS, SWEEP_BUDGET_S, TIMINGS_DIR, STAGE_NOTEBOOK, RUN_INTRO_FIRST,
                      HELD_MEMORY_HINT)
 from .device import free_bytes, release_pool
-from .testfield import field, cache_path
+from .testfield import field, field_cache_path
 from .ecc import gate
 from .sizing import DEVICE_BYTES_PER_VOXEL, sweep_sizes, load_machine, copy_gbs
 
@@ -90,7 +90,7 @@ def timed_sweep(fn, sizes, bytes_per_voxel, first_call=False, prepare=None):
                 dropped, reason = sizes[i:], f"would overrun the {SWEEP_BUDGET_S:.0f} s budget"
                 break
         # an uncached size is generated on the device first, at the generator's budget
-        generate = 0 if cache_path("field", n, ".npz").exists() else DEVICE_BYTES_PER_VOXEL["generate"]
+        generate = 0 if field_cache_path("field", n, ".npz").exists() else DEVICE_BYTES_PER_VOXEL["generate"]
         need = max(bytes_per_voxel, generate) * n ** 3
         free = free_bytes()[1]
         if need > free:

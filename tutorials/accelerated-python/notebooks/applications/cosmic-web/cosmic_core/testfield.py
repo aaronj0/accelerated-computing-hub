@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The Gaussian test field every tool is timed on: the BBKS spectrum, device-side generation and binning, the cache."""
+"""The Gaussian test field of the sweeps: the BBKS spectrum, device-side generation and binning, the cache; and `field`, the
+binned field of every size, which is the Quijote cube at the benchmark size."""
 
 import numpy as np
 
-from .config import K_BINS, NU_LO, NU_HI, R_SMOOTH_VOXELS, SEED, BOX_MPC, N_S, GAMMA, DATA_DIR
+from .config import K_BINS, NU_LO, NU_HI, R_SMOOTH_VOXELS, SEED, BOX_MPC, N_S, GAMMA, DATA_DIR, CANONICAL_N
 from .device import release_pool
 
 
@@ -115,8 +116,17 @@ def cache_path(kind, n, suffix):
     return DATA_DIR / f"{kind}_n{n}_k{K_BINS}_r{R_SMOOTH_VOXELS:g}_seed{SEED}{suffix}"
 
 
-# One device copy of the binned field per size, shared by every runner in this process. `bench.by_size` is not used
+def field_cache_path(kind, n, suffix):
+    """The cache file of `kind` for `field(n)`: the Quijote files at CANONICAL_N are named apart from the Gaussian ones."""
+    if n != CANONICAL_N:
+        return cache_path(kind, n, suffix)
+    DATA_DIR.mkdir(exist_ok=True)
+    return DATA_DIR / f"quijote_{kind}_n{n}_k{K_BINS}_r{R_SMOOTH_VOXELS:g}{suffix}"
+
+
+# One device copy of each binned field per size, shared by every runner in this process. `bench.by_size` is not used
 # here: it memoises the notebooks' own state and records its caller's line for the profiler probe.
+_GAUSSIAN = {}
 _FIELDS = {}
 
 
@@ -124,8 +134,8 @@ def make_binned_field(n):
     """(q, lam): the binned test field at size n (int32, on the device) and its λ.
 
     Generated and binned on the device once per size, cached under data/ as uint8 and widened to int32 on load."""
-    if n in _FIELDS:
-        return _FIELDS[n]
+    if n in _GAUSSIAN:
+        return _GAUSSIAN[n]
     import cupy as cp
     path = cache_path("field", n, ".npz")
     if path.exists():
@@ -137,10 +147,17 @@ def make_binned_field(n):
         del nu
         np.savez(path, q=cp.asnumpy(q.astype(cp.uint8)), lam=lam)
     release_pool()
-    _FIELDS[n] = (q, lam)
+    _GAUSSIAN[n] = (q, lam)
     return q, lam
 
 
 def field(n):
-    """The binned field at size n, int32 on the device, built once per size so that no timed call pays for it."""
-    return make_binned_field(n)[0]
+    """The binned field at size n, int32 on the device, built once per size so that no timed call pays for it: the
+    Quijote cube at CANONICAL_N, the Gaussian test field at every other size."""
+    if n not in _FIELDS:
+        if n == CANONICAL_N:
+            from .quijote import quijote_binned
+            _FIELDS[n] = quijote_binned()
+        else:
+            _FIELDS[n] = make_binned_field(n)
+    return _FIELDS[n][0]

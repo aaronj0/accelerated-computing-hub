@@ -1,16 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The cube of notebooks 90 and 95: Quijote when its file is present, else a Zel'dovich stand-in built on the host."""
-
-import os
-from pathlib import Path
+"""The Zel'dovich stand-in of notebook 90: the particle pictures and the density field of its first sections, built on the host."""
 
 import numpy as np
 
-from .config import R_SMOOTH_VOXELS, SEED, SIGMA8, CANONICAL_N, BOX_MPC, DEMO_BOX_MPC, DATA_DIR
+from .config import R_SMOOTH_VOXELS, SEED, SIGMA8, BOX_MPC, DEMO_BOX_MPC
 from .testfield import kgrid, kvectors, rfft_weights, power_spectrum, lam_from_sigmas, cache_path
-
-QUIJOTE_FILE = "df_m_256_CIC_z=0.npy"
-QUIJOTE_CITATION = "Villaescusa-Navarro et al. 2020, ApJS 250, 2, doi:10.3847/1538-4365/ab9d82"
 
 
 # --- The host pipeline: a Gaussian field, its smoothing and its standardisation ------------------
@@ -41,34 +35,6 @@ def standardise(field, sigma0_sq, sigma1_sq):
     """ν = (f − ⟨f⟩)/σ₀ as float32 and λ."""
     nu = (field - field.mean()) / np.sqrt(sigma0_sq)
     return nu.astype(np.float32), lam_from_sigmas(sigma0_sq, sigma1_sq)
-
-
-# --- The Quijote cube -------------------------------------------------------------------------
-
-def load_density_cube():
-    """(ν, λ, label) from the Quijote cube under data/ or $COSMIC_WEB_DATA, or None when the file is absent.
-
-    Whether the file holds δ, 1+δ or ρ is inferred from its mean."""
-    candidates = [DATA_DIR / QUIJOTE_FILE]
-    if os.environ.get("COSMIC_WEB_DATA"):
-        candidates.append(Path(os.environ["COSMIC_WEB_DATA"]) / QUIJOTE_FILE)
-    found = next((p for p in candidates if p.is_file()), None)
-    if found is None:
-        print(f"no Quijote cube under data/ or $COSMIC_WEB_DATA ({QUIJOTE_FILE}): using the Zel'dovich stand-in")
-        return None
-    arr = np.load(found).astype(np.float64)
-    mean = float(arr.mean())
-    if abs(mean) < 0.05:
-        convention, delta = "delta", arr - mean
-    elif abs(mean - 1.0) < 0.05:
-        convention, delta = "1+delta", arr - mean
-    else:
-        convention, delta = "rho", arr / mean - 1.0
-    nu, lam = standardise(*smooth_k(delta))
-    label = (f"Quijote fiducial {arr.shape[0]}^3 CIC at z = 0, {convention} in {found.name} "
-             f"({QUIJOTE_CITATION}); R = {R_SMOOTH_VOXELS:g} voxels")
-    print(label)
-    return nu, lam, label
 
 
 # --- The Zel'dovich stand-in --------------------------------------------------------------------
@@ -146,12 +112,8 @@ def zeldovich_particles(n=128, start=0.0, end=1.0, interval=0.1):
     return frames
 
 
-def load_dataset():
-    """(ν, λ, label): the Quijote cube when its file is present, else the Zel'dovich stand-in at CANONICAL_N."""
-    cube = load_density_cube()
-    if cube is not None:
-        return cube
-    n = CANONICAL_N
+def zeldovich_field(n=256):
+    """(ν, λ, label): the Zel'dovich stand-in on an n³ grid, built on the host once and cached under data/."""
     path = cache_path("zeldovich", n, ".npz")
     if path.exists():
         with np.load(path) as f:

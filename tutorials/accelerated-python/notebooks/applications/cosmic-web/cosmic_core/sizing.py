@@ -43,7 +43,7 @@ def sweep_sizes(stage):
 
 
 def benchmark_n():
-    """The shared benchmark size notebook 90 recorded in machine.json."""
+    """The shared benchmark size, the Quijote grid, as notebook 90 recorded it in machine.json."""
     machine = load_machine()
     if not machine.get("canonical"):
         raise RuntimeError(f"no machine.json: {RUN_INTRO_FIRST}")
@@ -77,21 +77,20 @@ def setup(stage, note=""):
 def save_sizing():
     """Measure the device's copy bandwidth and fix this machine's problem sizes, both recorded in machine.json.
 
-    The sweep is SWEEP_N up to what the generator and the host cache afford. The benchmark size is
-    CANONICAL_N when every main stage affords it, else the largest size they all do."""
+    The sweep is SWEEP_N up to what the generator affords. The benchmark size is CANONICAL_N, the Quijote grid; stops
+    when a main stage cannot afford it."""
     record = {"gpu_copy_gbs": measure_copy_bandwidth_gbs()}
     props = device_properties()
     dev = props["total_bytes"]
     print(f"  device memory              {dev / 2 ** 30:.0f} GiB")
     print(f"  device copy bandwidth      {record['gpu_copy_gbs']:.0f} GB/s (read + write)")
-    host = free_bytes()[0]
-    sweep = [n for n in SWEEP_N
-             if n ** 3 <= host and DEVICE_BYTES_PER_VOXEL["generate"] * n ** 3 <= DEVICE_FRACTION * dev]
+    sweep = [n for n in SWEEP_N if DEVICE_BYTES_PER_VOXEL["generate"] * n ** 3 <= DEVICE_FRACTION * dev]
     shared = sorted(set(sweep).intersection(*(set(_affordable(stage, sweep, dev)) for stage in MAIN_STAGES)))
-    if not shared:
-        raise RuntimeError(f"this device affords none of the sizes {SWEEP_N} for every main stage")
+    if CANONICAL_N not in shared:
+        raise RuntimeError(f"this device cannot hold the {CANONICAL_N}^3 Quijote cube for every main stage: "
+                           f"{DEVICE_BYTES_PER_VOXEL['cupy']} B/voxel at the peak")
     record["sweep"] = sweep
-    record["canonical"] = CANONICAL_N if CANONICAL_N in shared else shared[-1]
+    record["canonical"] = CANONICAL_N
     record.update({f"device_{k}": v for k, v in props.items()})
     MACHINE_PATH.write_text(json.dumps(record, indent=2))
     print(f"  benchmark size             N = {record['canonical']}^3")
