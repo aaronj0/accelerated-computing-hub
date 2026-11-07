@@ -360,6 +360,8 @@ RUN mkdir -p /opt/cosmic-web/data
 ADD --chmod=0444 --checksum=sha256:dea0cc8ac6be0c6758da305e40f34ec334bf6ad7ef9e6caa56c108a9664a28e7 https://github.com/aaronj0/accelerated-computing-hub/releases/download/sc26-data/quijote_fiducial_0_z0_positions.npy /opt/cosmic-web/data/
 ENV COSMIC_WEB_DATA=/opt/cosmic-web/data
 
+# The base service writes into this directory as the tutorial user; COPY --chmod sets the mode of the contents only.
+RUN mkdir -m 0777 -p /accelerated-computing-hub
 COPY --chmod=0777 . /accelerated-computing-hub
 
 WORKDIR /accelerated-computing-hub/tutorials/${ACH_TUTORIAL}/notebooks
