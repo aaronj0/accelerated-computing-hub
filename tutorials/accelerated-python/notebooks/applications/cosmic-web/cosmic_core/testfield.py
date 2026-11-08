@@ -152,8 +152,7 @@ def make_binned_field(n):
 
 
 def field(n):
-    """The binned field at size n, int32 on the device, built once per size so that no timed call pays for it: the
-    Quijote cube at CANONICAL_N, the Gaussian test field at every other size."""
+    """The binned field at size n, int32 on the device: the Quijote cube at CANONICAL_N, the Gaussian test field otherwise."""
     if n not in _FIELDS:
         if n == CANONICAL_N:
             from .quijote import quijote_binned
