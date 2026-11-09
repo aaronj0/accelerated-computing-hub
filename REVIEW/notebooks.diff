@@ -1,0 +1,599 @@
+--- PR head 2d0d06d: tutorials/accelerated-python/notebooks/applications/cosmic-web/90__cosmic_web__intro.ipynb
++++ sc26-pyhpc-v2 c1fdc91: tutorials/accelerated-python/notebooks/applications/cosmic-web/90__cosmic_web__intro.ipynb
+@@ -13,7 +13,6 @@
+ 7. [Sizing](#7-sizing)
+ 8. [Baseline](#8-baseline)
+ 9. [Ladder](#9-ladder)
+-10. [Conventions](#10-conventions)
+ 
+ ---
+ 
+@@ -63,19 +62,18 @@
+ cw.plot_points_to_field(n=256, growth=1.0)
+ 
+ ### cell 4 [markdown]
+-The resulting field $\nu$ is the input data we analyze in this tutorial.
++The resulting field $\nu$ is the kind of data we analyze in this tutorial.
+ 
+-Let's use a larger dataset and apply a threshold $\nu_0$ keeping cells with $\nu \ge \nu_0$. This mask allows us to understand the structures that form the web.
++Let's take a full 3D field and apply a threshold $\nu_0$ keeping cells with $\nu \ge \nu_0$. This mask allows us to understand the structures that form the web.
+ 
+ ---
+ 
+ **Quick Docs**
+ 
+-- `cw.load_dataset()`: `(nu, lam, label)`; `lam` is the parameter $\lambda$ of the Gaussian formula in §6
+-<!-- Once all the notebooks are almost finalizaed let's see we can stream the real dataset in the end). -->
++- `cw.zeldovich_field(n)`: `(nu, lam, label)`, the field of §2 on an $n^3$ grid; `lam` is the parameter $\lambda$ of the Gaussian formula in §6
+ 
+ ### cell 5 [code]
+-nu, lam, label = cw.load_dataset()
++nu, lam, label = cw.zeldovich_field(n=256)
+ print(f'nu: shape {nu.shape}, dtype {nu.dtype}, mean {nu.mean():.2f}, scatter {nu.std():.2f}')
+ cw.plot_slices(nu, thresholds=[2, 0, -1])
+ 
+@@ -98,7 +96,7 @@
+ - Apply a 3D stencil, followed by a histogram (both common patterns in HPC):
+     - The stencil reads each cell's neighbours.
+     - The histogram adds one count per cell to a table.
+-- The result is an integer, which can be checked for exactness without tolerances.
++- The result is an integer, so implementations can be compared exactly, without tolerances.
+ - A pass over the whole field returns a set of integers that can be plotted as a curve.
+ - For a Gaussian random field input, the curve is a known solution in closed form (§6): an independent check that our code is correct before we benchmark it.
+ 
+@@ -113,9 +111,7 @@
+ 
+ $$\chi = V - E + F$$
+ 
+-Vertices, edges and faces are the *cells* of the mask. The resulting $\chi$ is the Euler characteristic of the mask: the number of connected components minus the number of holes in them:
+-
+-![ec-illustration](./assets/euler-characteristic-dark.gif)
++Vertices, edges and faces are the *cells* of the mask. The resulting $\chi$ is the Euler characteristic of the mask: the number of connected components minus the number of holes in them.
+ 
+ Let's implement the count for three small masks:
+ 
+@@ -165,16 +161,18 @@
+ - At the initial levels, $\chi$ counts the blobs seen in the mask.
+ - As the level falls the blobs merge and holes open inside them: $\chi$ rises, then falls back.
+ 
+-#### One more dimension
+-
+ This value summarizes a shape's connectivity and holes, helping computational scientists track structures in simulations and volumetric data.
+ 
++![ec-illustration](./assets/euler-characteristic-dark.gif)
++
++#### One more dimension
++
+ - For ordinary 3D solids, $\chi = \text{connected pieces} - \text{tunnels} + \text{enclosed cavities}$: a solid ball gives $1$, a solid ring $0$, and a hollow shell $2$.
+ 
+-The meshes above are hollow surfaces, so they stop at faces. Our mask is solid, which adds a term. In 3D a grid cell is a *voxel*, and eight vertices join as a 2×2×2 *cube* that enters with a negative sign: $\chi = V - E + F - C.$
++The meshes above are hollow surfaces, so they stop at faces. Our mask is solid, which adds a term. In 3D a grid cell is a *voxel*: eight vertices join as a 2×2×2 *cube* that enters with a negative sign: $\chi = V - E + F - C.$
+ 
+ - Our box is **periodic**: opposite sides connect. Once every voxel is included, $\chi = 0$.
+-- Each voxel **owns eight cells** extending in the positive directions: one vertex, three edges ($+x,+y,+z$), three faces, and one cube. This counts each cell exactly once.
++- Each voxel owns **eight** cells extending in the positive directions: one vertex, three edges ($+x,+y,+z$), three faces, and one cube. This counts each cell exactly once.
+ 
+ Let's look at the masks on the data seen in §2 as 3D surfaces:
+ 
+@@ -214,7 +212,7 @@
+     print(f'level {level}: Tokens summed {chi_patch[level]:>2}  Formula V - E + F = {v} - {e} + {f} = {chi_direct}')
+ 
+ ### cell 18 [markdown]
+-The same on an 8×8×8 region of our dataset:
++The same on an 8×8×8 region of the field:
+ 
+ ### cell 19 [code]
+ cw.animate_birthdays(nu[:8, :8, :8], k=16)
+@@ -222,9 +220,26 @@
+ ### cell 20 [markdown]
+ ### 5. Reference
+ 
+-The CuPy implementation, `cw.ecc_hist_cupy(q, k)`, computes the histogram on the GPU.
++From here on we use a real simulation. The [Quijote simulations](https://quijote-simulations.readthedocs.io/) ([Villaescusa-Navarro et al. 2020](https://doi.org/10.3847/1538-4365/ab9d82)) follow $512^3$ dark-matter particles in a 1000 Mpc/h box under gravity to the present day. Let's deposit the particle positions on a grid with *cloud-in-cell* (CIC) assignment, where each particle shares its mass among the eight nearest cells, then apply the four steps of §2 on the GPU. 
++
++--- 
++
++The data is released under the [MIT License](https://quijote-simulations.readthedocs.io/en/latest/license.html), copyright 2019 Francisco Villaescusa-Navarro.
++
++
++**Quick Docs**
++
++- `cw.quijote_field()`: `(nu, lam, label)` on a $512^3$ grid, generated with CuPy from the particle positions. The positions are read from `$COSMIC_WEB_DATA` or `data/`.
++
++### cell 21 [code]
++nu, lam, label = cw.quijote_field()
++print(f'nu: shape {nu.shape}, dtype {nu.dtype}, mean {nu.mean():.2f}, scatter {nu.std():.2f}')
++cw.plot_slices(nu, thresholds=[2, 0, -1])
++
++### cell 22 [markdown]
++Let's look at a solution implemented with CuPy: `cw.ecc_hist_cupy(q, k)` computes the histogram on the GPU.
+ 
+-- Input: an array `q` of bin indices from $0$ to $K-1$, read by every tool in this tutorial.
++- Input: an array `q` of bin indices from $0$ to $K-1$ (read by later notebooks).
+ - Output: the token histogram, one integer per bin.
+ 
+ ```py
+@@ -252,9 +267,9 @@
+ - **Compute birth bins.** `ecc_cells_cupy` finds the lowest corner bin for each cell: two corners for an edge, four for a face, and eight for a cube. The repeated `cp.minimum` calls build these results from pairs of neighbours.
+ - **Histogram.** `ecc_hist_cupy` uses `cp.bincount` to count how many cells are born in each bin. It adds the vertex and face counts and subtracts the edge and cube counts.
+ 
+-Binning preserves order, so taking the minimum before or after binning gives the same birth bin. This ensures the histogram is exact for the binned field.
++Binning preserves order: taking the minimum before or after binning gives the same birth bin. This ensures the histogram is exact for the binned field.
+ 
+-Let's run the reference on the full field `nu` loaded from our dataset in §2.
++Let's run the reference on the Quijote field `nu`.
+ 
+ ---
+ 
+@@ -264,7 +279,7 @@
+ - `cw.bin_edges()`: the lower edge of every bin.
+ - `cw.ecc_from_hist(hist)`: $\chi$ at every bin edge.
+ 
+-### cell 21 [code]
++### cell 23 [code]
+ K = cw.K_BINS
+ q = cw.quantise(cp.asarray(nu))
+ edges = cw.bin_edges()
+@@ -274,18 +289,18 @@
+ print(f'N = {nu.shape[0]}^3, K = {K}: sum(tokens) = {hist.sum()}, max |chi| = {np.abs(chi).max()}')
+ cw.plot_hist_curve(edges, hist, chi)
+ 
+-### cell 22 [markdown]
++### cell 24 [markdown]
+ The histogram is positive at high levels, where mostly vertices are born, and negative in the middle, where edges dominate.
+ 
+ ### 6. Validation
+ 
+-All notebooks use the same Gaussian random test field generated for growing grid sizes. The solution to its expected curve $\chi(\nu)$ is known in closed form ([Hamilton et al. 1986](https://doi.org/10.1086/164571)):
++The other sweep sizes in every notebook use a Gaussian random test field. The solution to its expected curve $\chi(\nu)$ is known in closed form ([Hamilton et al. 1986](https://doi.org/10.1086/164571)):
+ 
+ $$\langle\chi(\nu)\rangle = V\,\frac{\lambda^{3}}{(2\pi)^{2}}\,(\nu^{2}-1)\,e^{-\nu^{2}/2}, \qquad \lambda^{2} = \tfrac{1}{3}\langle|\nabla\nu|^{2}\rangle,$$
+ 
+-where $V$ is the number of voxels and the gradient $\nabla\nu$ is taken in voxel units. The factor $(\nu^{2}-1)$ puts the zero crossings at $\nu = \pm 1$, so they do not depend on $\lambda$ or $V$.
++where $V$ is the number of voxels and the gradient $\nabla\nu$ is taken in voxel units. The factor $(\nu^{2}-1)$ causes the curve to cross zero at $\nu = \pm 1$, independent of $\lambda$ or $V$.
+ 
+-Let's generate the test field at the size of our dataset and overlay the formula.
++Let's generate the test field at the same size and overlay the formula.
+ 
+ ---
+ 
+@@ -293,9 +308,9 @@
+ 
+ - `cw.make_binned_field(n)`: `(q, lam)`, the binned test field (int32, on device) and $\lambda$, computed from the field.
+ - `cw.chi_gaussian(edges, lam, volume)`: the expected $\chi$ at every bin edge.
+-- `cw.plot_overlay(edges, chi, pred)`: plots the measured $\chi$ over the formula, with their difference, below. Returns `(rel, zeros)`: the largest difference relative to the solution, and the levels where $\chi$ crosses zero.
++- `cw.plot_overlay(edges, chi, pred)`: plots the measured $\chi$ over the formula, with their difference. Returns `(rel, zeros)`: the largest difference relative to the solution, and the levels where $\chi$ crosses zero.
+ 
+-### cell 23 [code]
++### cell 25 [code]
+ N = nu.shape[0]
+ q, lam = cw.make_binned_field(N)
+ chi = cw.ecc_from_hist(cp.asnumpy(cw.ecc_hist_cupy(q)))
+@@ -304,23 +319,23 @@
+ print(f'relative difference {rel:.3f} (tolerance {cw.ANALYTIC_TOL}), zero crossings at nu = {np.round(zeros, 2).tolist()}')
+ assert rel < cw.ANALYTIC_TOL, rel
+ 
+-### cell 24 [markdown]
++### cell 26 [markdown]
+ - Both curves cross zero near $\nu = \pm 1$, as the formula predicts.
+ 
+-### cell 25 [markdown]
++### cell 27 [markdown]
+ ### 7. Sizing
+ 
+-We select problem sizes based on the machine's available memory, then measure device copy bandwidth, used as a reference for later benchmarks. Each tool skips sizes where its temporary arrays would exceed device memory.
++We select the sweep sizes from the GPU's memory, then measure device copy bandwidth, used as a reference for later benchmarks. Each tool skips sizes where its temporary arrays would exceed device memory.
+ 
+-### cell 26 [code]
++### cell 28 [code]
+ cw.save_sizing()
+ 
+-### cell 27 [markdown]
++### cell 29 [markdown]
+ ### 8. Baseline
+ 
+ Time the reference histogram at the shared benchmark size and save it to `timings/cupy.json`. Later notebooks save their results alongside it. The field is binned on the GPU, while the cumulative sum runs on the CPU, outside the timing. Would moving it to the GPU help?
+ 
+-- The histogram is copied back to the host for validation either way. A cumulative sum over $K$ values costs less on the CPU than the required kernel launches on the GPU.
++- Every tool returns its $K$-value histogram to the host, where a cumulative sum costs less than the kernel launches it would need on the GPU.
+ - The same step is shared by all tools, so the timed region is where our implementation differs.
+ 
+ ---
+@@ -328,10 +343,10 @@
+ **Quick Docs**
+ 
+ - `cw.field(n)`: returns the binned $n^3$ field on the GPU, built once per size before timing.
+-- `cw.measure(stage, run, n, ...)`: times the first call and the median of repeated calls. Ensures an exact match to the reference curve. Saves to `timings/<stage>.json` if `record=True`. Runs `prepare(n)` before timing.
++- `cw.measure(stage, run, n, ...)`: times the first call and the median of repeated calls. Ensures an exact match to the reference curve. Saves to `timings/<stage>.json` if `record=True`.
+ - `cw.save_sweep(stage, run)`: benchmarks sizes that fit in memory, checks results against the reference, and appends them to the stage file. Reports skipped sizes.
+ 
+-### cell 28 [code]
++### cell 30 [code]
+ N = cw.benchmark_n()
+ 
+ 
+@@ -344,10 +359,10 @@
+ cw.measure('cupy', run_cupy, N)
+ cw.save_sweep('cupy', run_cupy)
+ 
+-### cell 29 [markdown]
++### cell 31 [markdown]
+ ### 9. Ladder
+ 
+-Each notebook implements `ecc_hist_<tool>` using the field already on the GPU. Results must match the CuPy reference exactly, and the histogram must sum to zero:
++Each notebook implements `ecc_hist_<tool>` using the field already on the GPU. The resulting histogram must match the CuPy reference exactly and sum to zero:
+ 
+ $$\max_b |\chi_{\text{tool}}[b] - \chi_{\text{cupy}}[b]| = 0 \quad\text{and}\quad \sum_b \text{hist}[b] = 0.$$
+ 
+@@ -357,17 +372,10 @@
+ | 92 | **JAX** | XLA: JIT compilation and kernel fusion |
+ | 93 | **cuda.compute** | Iterators compute the stencil inside a library kernel |
+ | 93 | **numba-cuda** | A Python CUDA kernel with a shared-memory histogram |
+-| 94 | **CppJIT** | Binding to C++ implementations of histogram kernels |
+-
+-`95__cosmic_web__synthesis.ipynb` compares the curves, timelines, and memory traffic using results from `timings/`.
+-
+-### 10. Conventions
++| 94 | **CppJIT** | Interop with CUDA C++ kernels |
+ 
+-- **Live notebooks:** `NN__topic__subtopic.ipynb`. Complete the `# TODO:` cells marked `...`.
+-- **Solutions:** `solutions/NN__topic__subtopic__SOLUTION.ipynb`.
+-- **Quick Docs:** API notes before first use.
+-- **Extra credit:** optional cells marked `# EXTRA CREDIT:`.
++`95__cosmic_web__synthesis.ipynb` analyzes the results from `timings/` and compares the resulting curves, timelines, and memory traffic.
+ 
+-Shut down each notebook's Jupyter kernel before starting the next to release its GPU memory. If memory is insufficient, the next notebook stops at its first cell and reports the shortfall.
++Shut down each notebook's Jupyter kernel before starting the next to release its GPU memory. If memory is insufficient, the next notebook stops and reports at its first cell.
+ 
+ Next: `91__cosmic_web__cupy__array_model.ipynb` traces the reference implementation and measures each operation's cost.
+--- PR head 2d0d06d: tutorials/accelerated-python/notebooks/applications/cosmic-web/solutions/91__cosmic_web__cupy__array_model__SOLUTION.ipynb
++++ sc26-pyhpc-v2 c1fdc91: tutorials/accelerated-python/notebooks/applications/cosmic-web/91__cosmic_web__cupy__array_model.ipynb
+@@ -1,11 +1,9 @@
+ 
+ ### cell 0 [markdown]
+-## Cosmic Web - CuPy - Array Model - SOLUTION
++## Cosmic Web - CuPy - Array Model
+ 
+ [CuPy](https://docs.cupy.dev/en/stable/) ran our reference solution on the GPU using NumPy-like array expressions. Let's try to improve its performance.
+ 
+-**SOLUTION**
+-
+ ### Table of Contents
+ 
+ 1. [Setup](#1-setup)
+@@ -20,7 +18,7 @@
+ 
+ ### 1. Setup
+ 
+-We use the binned test field of the intro. Every result must match the CuPy reference exactly.
++We use the binned Quijote field of the intro. Every result must match the CuPy reference exactly.
+ 
+ ---
+ 
+@@ -95,14 +93,14 @@
+ 
+ **Quick Docs**
+ 
+-- `cw.trace_call(stage, run, n, ...)`: traces one call of `run` with Nsight Systems, prints its kernels, copies and memsets, and writes `launch_<stage>.nsys-rep`. With `memory=True` the report also records every allocation of the call.
++- `cw.trace_call(stage, run, n, ...)`: traces one call of `run` with Nsight Systems, prints its kernels, copies and memsets, and writes `nsys-reports/launch_<stage>.nsys-rep`. With `memory=True` the report also records every allocation of the call.
+ 
+ ### cell 9 [code]
+ trace = cw.trace_call('cupy', run_cupy, N, [ecc_cells_cupy, signed_hist, ecc_hist_cupy], memory=True)
+ 
+ ### cell 10 [markdown]
+ - Every `cp.roll`, `cp.minimum` and `cp.bincount` launches at least one kernel. The roll along axis 0 moves the body of the array with one device-to-device memcpy.
+-- `cp.bincount` checks the input sign and uses its maximum to size the output. The code needs both scalars, causing device-to-host copies that synchronise.
++- `cp.bincount` checks the input sign and uses its maximum to size the output. This requires both scalars, causing device-to-host copies and synchronisation.
+ - `cp.bincount` zeroes its output before counting, causing the memsets.
+ - Eight allocations the size of the field: the seven birth arrays and one roll copy at a time.
+ 
+@@ -138,7 +136,7 @@
+ - We can replace each `cp.roll` with two slice pairs: `a[:-1]` against `a[1:]`, then the last plane against the first. Slices are views.
+ - `cp.minimum(a, b, out=buf)` writes into a preallocated buffer, which may be a view.
+ 
+-Implement `min_shift` below. It writes the shifted minimum along one axis into `out`.
++`min_shift` below writes the shifted minimum along one axis into `out`.
+ 
+ ---
+ 
+--- PR head 2d0d06d: tutorials/accelerated-python/notebooks/applications/cosmic-web/solutions/92__cosmic_web__jax__fusion__SOLUTION.ipynb
++++ sc26-pyhpc-v2 c1fdc91: tutorials/accelerated-python/notebooks/applications/cosmic-web/92__cosmic_web__jax__fusion.ipynb
+@@ -1,11 +1,9 @@
+ 
+ ### cell 0 [markdown]
+-## Cosmic Web - JAX - Fusion - SOLUTION
++## Cosmic Web - JAX - Fusion
+ 
+ [JAX](https://docs.jax.dev/en/latest/) compiles the same array code with `jax.jit`. It first *traces* the function, recording every operation on *tracers* (placeholders that carry a shape and a dtype). Its compiler, XLA, then *fuses* neighbouring operations into one kernel where it can.
+ 
+-**SOLUTION**
+-
+ ### Table of Contents
+ 
+ 1. [Setup](#1-setup)
+@@ -200,7 +198,7 @@
+ 
+ Why do the scatters dominate? A scatter-add performs one atomic add per element into one of $K$ addresses. Adds to the same address contend and are serialised.
+ 
+-Let's split the births into $M$ slabs of $S$ voxels and give each slab its own histogram. The adds then spread over $MK$ addresses. Implement `bc` below.
++Let's split the births into $M$ slabs of $S$ voxels and give each slab its own histogram. The adds then spread over $MK$ addresses. Below, `bc` counts each slab into its own row, then sums the rows.
+ 
+ ---
+ 
+--- PR head 2d0d06d: tutorials/accelerated-python/notebooks/applications/cosmic-web/solutions/93__cosmic_web__cccl__iterators__SOLUTION.ipynb
++++ sc26-pyhpc-v2 c1fdc91: tutorials/accelerated-python/notebooks/applications/cosmic-web/93__cosmic_web__cccl__iterators.ipynb
+@@ -1,11 +1,9 @@
+ 
+ ### cell 0 [markdown]
+-## Cosmic Web - cuda.compute - Iterators - SOLUTION
++## Cosmic Web - cuda.compute - Iterators
+ 
+ [cuda.compute](https://nvidia.github.io/cccl/python/) is the Python library of the CUDA Core Compute Libraries (CCCL). It provides ready-made GPU algorithms such as sorts and histograms, which run the C++ kernels of CUB. An algorithm can read an *iterator*, which computes each element on demand. We can then compute the births inside the library's kernel without storing them.
+ 
+-**SOLUTION**
+-
+ ### Table of Contents
+ 
+ 1. [Setup](#1-setup)
+@@ -54,7 +52,7 @@
+ - **Read the corner.** `corner(q, offset, n)` permutes `q` by those indices: the field value at every voxel's corner.
+ - **Take the minimum.** `births(q, n, corners)` zips the corners of a cell and applies `min2`, `min4` or `min8`.
+ 
+-`CELLS` lists each cell type's sign and the offsets of its corners. Add the three faces and the cube below.
++`CELLS` lists each cell type's sign and the offsets of its corners.
+ 
+ ---
+ 
+@@ -99,9 +97,11 @@
+     'ex':  (-1, [(0, 0, 0), (1, 0, 0)]),
+     'ey':  (-1, [(0, 0, 0), (0, 1, 0)]),
+     'ez':  (-1, [(0, 0, 0), (0, 0, 1)]),
++    # A face spans four corners: the voxel, its two edge neighbours and one diagonal neighbour.
+     'fxy': (+1, [(0, 0, 0), (1, 0, 0), (0, 1, 0), (1, 1, 0)]),
+     'fxz': (+1, [(0, 0, 0), (1, 0, 0), (0, 0, 1), (1, 0, 1)]),
+     'fyz': (+1, [(0, 0, 0), (0, 1, 0), (0, 0, 1), (0, 1, 1)]),
++    # The cube spans all eight.
+     'c':   (-1, [(0, 0, 0), (1, 0, 0), (0, 1, 0), (1, 1, 0), (0, 0, 1), (1, 0, 1), (0, 1, 1), (1, 1, 1)]),
+ }
+ 
+@@ -116,7 +116,7 @@
+ ### cell 4 [markdown]
+ ### 3. Histogram
+ 
+-Let's count the births with `histogram_even`. With $K + 1$ levels (bin boundaries) from $0$ to $K$, each bin covers one integer, so bin $b$ counts the births equal to $b$. The algorithm fills one histogram per call, so our eight cell types need eight passes over the field. Implement the `histogram_even` call below.
++Let's count the births with `histogram_even`. With $K + 1$ levels (bin boundaries) from $0$ to $K$, each bin covers one integer, so bin $b$ counts the births equal to $b$. The algorithm fills one histogram per call, so our eight cell types need eight passes over the field.
+ 
+ ---
+ 
+--- PR head 2d0d06d: tutorials/accelerated-python/notebooks/applications/cosmic-web/solutions/94__cosmic_web__cppjit__cuda_kernel__SOLUTION.ipynb
++++ sc26-pyhpc-v2 c1fdc91: tutorials/accelerated-python/notebooks/applications/cosmic-web/94__cosmic_web__cppjit__cuda_kernel.ipynb
+@@ -1,11 +1,9 @@
+ 
+ ### cell 0 [markdown]
+-## Cosmic Web - CppJIT - CUDA Kernel - SOLUTION
++## Cosmic Web - CppJIT - CUDA Kernel
+ 
+ [CppJIT](https://github.com/compiler-research/cppjit) compiles C++ and CUDA code inside the Python session. We first call CUB's histogram from C++, then launch our own kernel, passing CuPy's arrays and stream directly.
+ 
+-**SOLUTION**
+-
+ ### Table of Contents
+ 
+ 1. [Setup](#1-setup)
+@@ -25,7 +23,7 @@
+ 
+ **Quick Docs**
+ 
+-- `cppjit.cppdef(src)`: compiles C++ or CUDA source into the session. Its functions and kernels appear as `cppjit.gbl.<name>`.
++- `cppjit.cppdef(src)`: compiles C++ or CUDA source into the session. Its functions and kernels become automatically available as Python proxies under the global namespace: `cppjit.gbl.<name>`.
+ 
+ ### cell 1 [code]
+ import importlib.metadata
+@@ -35,18 +33,18 @@
+ import numpy as np
+ import cupy as cp
+ 
+-import cosmic_core as cw            # sets the interpreter's optimisation level before cppjit starts
++import cosmic_core as cw
+ import cppjit
+ 
+ assert cppjit.CUDA_ENABLED, 'this notebook needs the CUDA-enabled tutorial image'
+ 
+ N, K = cw.setup('cppjit_cub', f"cppjit {importlib.metadata.version('cppjit')}, "
+-                                  f"interpreter arguments {os.environ['CPPINTEROP_EXTRA_INTERPRETER_ARGS']}")
++                                  f"interpreter arguments --cuda {os.environ['CPPINTEROP_EXTRA_INTERPRETER_ARGS']}")
+ 
+ ### cell 2 [markdown]
+ ### 2. CUB from C++
+ 
+-Let's call `DeviceHistogram` from [CUB](https://github.com/NVIDIA/cccl/tree/main/cub) directly, in place of `cp.bincount`. `cosmic_cub_histogram.cu` wraps it in a function that takes GPU pointers and the stream as integers.
++Let's call `DeviceHistogram` from [CUB](https://github.com/NVIDIA/cccl/tree/main/cub) directly, in place of `cp.bincount`. `cub_histogram.cu` wraps it in a function that takes GPU pointers and the stream as integers.
+ 
+ ---
+ 
+@@ -57,7 +55,7 @@
+ 
+ ### cell 3 [code]
+ t0 = time.perf_counter()
+-cppjit.cppdef(cw.cub_histogram_source())
++cppjit.cppdef(open('cub_histogram.cu').read())
+ cppdef_cub_s = time.perf_counter() - t0
+ print(f'cppdef of the CUB wrapper: {cppdef_cub_s * 1e3:.0f} ms')
+ 
+@@ -90,14 +88,14 @@
+ ### cell 5 [markdown]
+ ### 3. Kernel
+ 
+-How do we remove both costs? The numba kernel of the previous notebook computes each thread's births without writing them to memory and counts them in one pass. `cosmic_ecc.cu` is the same algorithm in CUDA C++:
++How do we remove both costs? The numba kernel of the previous notebook computes each thread's births without writing them to memory and counts them in one pass. `ecc_histogram.cu` is the same algorithm in CUDA C++:
+ 
+ - **Compute births.** Each thread loads its $2\times2\times2$ window and takes the eight births with `min`.
+ - **Count in shared memory.** Each thread adds $\pm 1$ at each birth bin in the block's `__shared__` histogram.
+ - **Flush.** After `__syncthreads()`, the block adds its non-zero counters into the global histogram with `atomicAdd`.
+ 
+ ### cell 6 [markdown]
+-Write the kernel body below. The zeroing, the periodic indices, the barrier and the flush are written. A name defined by `cppdef` lasts for the whole session. To change a compiled body, restart the Jupyter kernel.
++Let's compile `ecc_histogram.cu` into the session.
+ 
+ ---
+ 
+@@ -105,31 +103,10 @@
+ 
+ - `__global__ void kernel(...)`: a [CUDA C++](https://docs.nvidia.com/cuda/cuda-programming-guide/) kernel, launched on a grid of thread blocks. `blockIdx`, `blockDim` and `threadIdx` give each thread its index.
+ - `atomicAdd(int*, int)`, `atomicSub(int*, int)`: atomic add or subtract at an address in shared or global memory.
+-- `cw.ecc_cuda_source(body)`: returns `cosmic_ecc.cu` with `body` inserted at its markers.
+ 
+ ### cell 7 [code]
+-KERNEL_BODY = r'''
+-        const int v000 = q[i * nn + j * n + k],   v100 = q[i1 * nn + j * n + k];
+-        const int v010 = q[i * nn + j1 * n + k],  v110 = q[i1 * nn + j1 * n + k];
+-        const int v001 = q[i * nn + j * n + k1],  v101 = q[i1 * nn + j * n + k1];
+-        const int v011 = q[i * nn + j1 * n + k1], v111 = q[i1 * nn + j1 * n + k1];
+-        const int ex = min(v000, v100), ey = min(v000, v010), ez = min(v000, v001);
+-        const int fxy = min(ex, min(v010, v110));
+-        const int fxz = min(ex, min(v001, v101));
+-        const int fyz = min(ey, min(v001, v011));
+-        const int c   = min(fxy, min(min(v001, v101), min(v011, v111)));
+-        atomicAdd(&sh[v000], 1);
+-        atomicSub(&sh[ex], 1);
+-        atomicSub(&sh[ey], 1);
+-        atomicSub(&sh[ez], 1);
+-        atomicAdd(&sh[fxy], 1);
+-        atomicAdd(&sh[fxz], 1);
+-        atomicAdd(&sh[fyz], 1);
+-        atomicSub(&sh[c], 1);
+-'''
+-
+ t0 = time.perf_counter()
+-cppjit.cppdef(cw.ecc_cuda_source(body=KERNEL_BODY))
++cppjit.cppdef(open('ecc_histogram.cu').read())
+ cppdef_s = time.perf_counter() - t0
+ print(f'cppdef of the kernel: {cppdef_s * 1e3:.0f} ms')
+ 
+@@ -138,8 +115,6 @@
+ 
+ Let's launch the kernel with one thread per voxel, on CuPy's current stream. The shared histogram is static, so the dynamic shared memory is zero.
+ 
+-Write the launch below.
+-
+ ---
+ 
+ **Quick Docs**
+@@ -181,10 +156,9 @@
+ trace = cw.trace_call('cppjit_cuda', run_cppjit, N, [ecc_hist_cppjit], header=f'''
+ import cppjit
+ BLOCK = {BLOCK}
+-KERNEL_BODY = r"""{KERNEL_BODY}"""
+-cppjit.cppdef(cw.ecc_cuda_source(body=KERNEL_BODY))
++cppjit.cppdef(open('ecc_histogram.cu').read())
+ ''', quiet=True)
+-cub = cw.trace_call('cppjit_cub', run_cub, N, [ecc_hist_cub], header='import cppjit\ncppjit.cppdef(cw.cub_histogram_source())',
++cub = cw.trace_call('cppjit_cub', run_cub, N, [ecc_hist_cub], header="import cppjit\ncppjit.cppdef(open('cub_histogram.cu').read())",
+                     state=[f'SIGNS = {SIGNS}', 'CUB_HISTS = [cp.zeros(K, dtype=cp.int32) for _ in SIGNS]'], quiet=True)
+ calls = {'CUB from C++': cub, 'the kernel': trace}
+ cw.call_table(calls)
+@@ -193,7 +167,7 @@
+ cw.save_sweep('cppjit_cuda', run_cppjit)
+ 
+ ### cell 14 [markdown]
+-**EXTRA CREDIT: profile**
++**Profiling the kernel**
+ 
+ Why is the measured time above this estimate? [Nsight Compute](https://docs.nvidia.com/nsight-compute/) replays one launch and reads the GPU's hardware counters: how busy the SMs and the memory system were, what the warps waited for, and which level of the memory hierarchy served each load.
+ 
+@@ -204,7 +178,6 @@
+ - `cw.ncu_report(stage, n, title, ...)`: profiles one launch with `ncu --set full` and prints the throughput, memory-hierarchy and stall metrics.
+ 
+ ### cell 15 [code]
+-# EXTRA CREDIT: the kernel of section 3 on the profiler.
+ cw.ncu_report('cppjit_cuda', N, f'one launch at N = {N}^3:')
+ 
+ ### cell 16 [markdown]
+@@ -216,16 +189,13 @@
+ - The per-voxel atomics stay in shared memory. The flush runs as reductions in L2.
+ 
+ ### cell 17 [markdown]
+-What if the grid gave each thread its $i$ and $j$ directly? `ecc_hist_rows_kernel` in `cosmic_ecc_variants.cu` runs the same body on a 3D grid of `(1, n, n)` thread blocks:
++What if the grid gave each thread its $i$ and $j$ directly? `ecc_hist_rows_kernel` in `ecc_histogram_rows.cu` runs the same body on a 3D grid of `(1, n, n)` thread blocks:
+ 
+ - **Grid.** One thread block per row: `blockIdx.z` gives $i$ and `blockIdx.y` gives $j$.
+ - **Threads.** Each thread walks several voxels along $k$. The block size sets how many, so we sweep it, then profile one.
+ 
+-Write its launch below.
+-
+ ### cell 18 [code]
+-# EXTRA CREDIT: the rows kernel.
+-cppjit.cppdef(cw.ecc_cuda_variants_source())
++cppjit.cppdef(open('ecc_histogram_rows.cu').read())
+ 
+ 
+ def ecc_hist_rows(q, block):
+@@ -252,7 +222,7 @@
+ cw.ncu_report('rows', N, f'\nthe rows kernel, {(N + ROWS_BLOCK - 1) // ROWS_BLOCK} voxels per thread, one launch at N = {N}^3:',
+               run=run_rows, functions=[ecc_hist_rows], args=(ROWS_BLOCK,), header='''
+ import cppjit
+-cppjit.cppdef(cw.ecc_cuda_variants_source())
++cppjit.cppdef(open('ecc_histogram_rows.cu').read())
+ ''')
+ 
+ ### cell 20 [markdown]
+--- PR head 2d0d06d: tutorials/accelerated-python/notebooks/applications/cosmic-web/95__cosmic_web__synthesis.ipynb
++++ sc26-pyhpc-v2 c1fdc91: tutorials/accelerated-python/notebooks/applications/cosmic-web/95__cosmic_web__synthesis.ipynb
+@@ -78,7 +78,7 @@
+ Let's draw the curve of our dataset against the Gaussian expectation.
+ 
+ ### cell 9 [code]
+-nu, lam, _ = cw.load_dataset()
++nu, lam, _ = cw.quijote_field()
+ q = cw.quantise(cp.asarray(nu), K)
+ hist = cp.asnumpy(cw.ecc_hist_cupy(q, K))
+ assert hist.sum() == 0, hist.sum()
+@@ -94,13 +94,13 @@
+ ### cell 11 [markdown]
+ ### 5. Programming models
+ 
+-| tool | the tool provides | we write | what we changed to optimize |
++| tool | provides | we write | optimization |
+ |---|---|---|---|
+-| **CuPy** | a kernel for every array expression | the expressions, views and buffers | views and preallocated buffers in place of the shifted copies |
+-| **JAX** | tracing, XLA's fusion, one executable | the function and its static arguments | the fused chain, then slabs against the scatters' contention |
+-| **cuda.compute** | CUB's algorithms, with the iterators compiled into their kernels | the iterators and the algorithm call | iterators in place of stored birth arrays |
+-| **numba-cuda** | a CUDA kernel compiled from Python | the thread mapping, the shared-memory histogram, the launch | one pass with a shared-memory histogram in place of eight passes |
+-| **CppJIT** | C++ and CUDA compiled in the session, called with CuPy's pointers and stream | CUB's call, the kernel in CUDA C++, its launch | CUB called directly, then one kernel in place of the stencil and the passes |
++| **CuPy** | one kernel per array expression | array expressions | views and preallocated buffers in place of shifted copies |
++| **JAX** | tracing, XLA fusion, one executable | a function with static arguments | the fused chain, then slabs against scatter contention |
++| **cuda.compute** | CUB algorithms with iterators compiled into their kernels | iterators and the algorithm call | iterators in place of stored birth arrays |
++| **numba-cuda** | CUDA kernels compiled from Python | a kernel in Python and its launch | one pass with a shared-memory histogram in place of eight |
++| **CppJIT** | C++ and CUDA compiled in the session | CUB's call, then a CUDA C++ kernel and its launch | one kernel in place of the stencil and the eight passes |
+ 
+ Takeaways:
+ 
+--- PR head 2d0d06d: tutorials/accelerated-python/notebooks/syllabi/sc26__8_hours.ipynb
++++ sc26-pyhpc-v2 c1fdc91: tutorials/accelerated-python/notebooks/syllabi/sc26__8_hours.ipynb
+@@ -11,12 +11,12 @@
+ | 05 | [Power Iteration - CuPy - Memory Spaces](../fundamentals/05__memory_spaces__power_iteration.ipynb) | [Click](../fundamentals/solutions/05__memory_spaces__power_iteration__SOLUTION.ipynb) | CuPy |
+ | 06 | [Power Iteration - CuPy - Asynchrony](../fundamentals/06__asynchrony__power_iteration.ipynb) | [Click](../fundamentals/solutions/06__asynchrony__power_iteration__SOLUTION.ipynb) | CuPy, Nsight Systems |
+ | 90 | [Mini-App: Cosmic Web Intro](../applications/cosmic-web/90__cosmic_web__intro.ipynb) | [Slides](https://compiler-research.org/tutorials/sc26/) | NumPy, CuPy |
+-| 91 | [Mini-App: CuPy - Array Model](../applications/cosmic-web/91__cosmic_web__cupy__array_model.ipynb) | [Click](../applications/cosmic-web/solutions/91__cosmic_web__cupy__array_model__SOLUTION.ipynb) | CuPy |
+-| 92 | [Mini-App: JAX - Fusion](../applications/cosmic-web/92__cosmic_web__jax__fusion.ipynb) | [Click](../applications/cosmic-web/solutions/92__cosmic_web__jax__fusion__SOLUTION.ipynb) | JAX |
+-| 93 | [Mini-App: cuda.compute - Iterators](../applications/cosmic-web/93__cosmic_web__cccl__iterators.ipynb) | [Click](../applications/cosmic-web/solutions/93__cosmic_web__cccl__iterators__SOLUTION.ipynb) | cuda.compute, Numba CUDA |
+-| 94 | [Mini-App: CppJIT - CUDA C++ Kernel](../applications/cosmic-web/94__cosmic_web__cppjit__cuda_kernel.ipynb) | [Click](../applications/cosmic-web/solutions/94__cosmic_web__cppjit__cuda_kernel__SOLUTION.ipynb) | CppJIT, CUDA |
++| 91 | [Mini-App: CuPy - Array Model](../applications/cosmic-web/91__cosmic_web__cupy__array_model.ipynb) | - | CuPy |
++| 92 | [Mini-App: JAX - Fusion](../applications/cosmic-web/92__cosmic_web__jax__fusion.ipynb) | - | JAX |
++| 93 | [Mini-App: cuda.compute - Iterators](../applications/cosmic-web/93__cosmic_web__cccl__iterators.ipynb) | - | cuda.compute, Numba CUDA |
++| 94 | [Mini-App: CppJIT - CUDA C++ Kernel](../applications/cosmic-web/94__cosmic_web__cppjit__cuda_kernel.ipynb) | - | CppJIT, CUDA |
+ | 95 | [Mini-App: Synthesis](../applications/cosmic-web/95__cosmic_web__synthesis.ipynb) | - | - |
+-| - | Domain Science Examples | [Slides](https://compiler-research.org/tutorials/sc26/) | - |
++| - | Domain Science Examples | [Notebooks](https://compiler-research.org/live-cpp-tutorials/) | - |
+ | 29 | [DragonHPC/cuPhoton](../libraries/29__dragonhpc_cuphoton__bootstrap.ipynb) | - | DragonHPC, cuPhoton |
+ 
+ ### Materials
+@@ -29,7 +29,7 @@
+ 
+ This tutorial takes the array model from NumPy to the GPU and then into a practical mini-application. We start with NumPy and the `ndarray` memory model, move the same workflows to the GPU with CuPy, place data deliberately in host and device memory, and profile asynchronous execution.
+ 
+-We explore an HPC mini-application solving the Euler characteristic curve of a cosmic-web density field, a 3D stencil followed by a histogram, implemented with CuPy, JAX, cuda.compute, Numba CUDA, and CppJIT. We then go over examples of scientific applications that interoperate efficiently between Python and C++. The day closes with a session on cuPhoton and DragonHPC (placeholder).
++We explore an HPC mini-application solving the Euler characteristic curve of a cosmic-web density field: 3D stencil followed by a histogram, implemented with CuPy, JAX, cuda.compute, Numba CUDA, and CppJIT. We then go over examples of scientific applications that interoperate efficiently between Python and C++. The day closes with a session on cuPhoton and DragonHPC (placeholder).
+ 
+ In this tutorial we will cover:
+ - NumPy fundamentals and the `ndarray` memory model.

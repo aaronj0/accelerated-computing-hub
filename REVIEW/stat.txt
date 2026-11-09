@@ -1,0 +1,38 @@
+ .dockerignore                                                                            |   1 -
+ tutorials/accelerated-python/README.md                                                   |   8 +-
+ tutorials/accelerated-python/brev/clang-cuda-13.2-rsqrt.inc                              |  11 --
+ tutorials/accelerated-python/brev/dockerfile                                             |  39 ++--
+ tutorials/accelerated-python/brev/requirements.txt                                       |   7 +-
+ tutorials/accelerated-python/notebooks/applications/cosmic-web/.gitignore                |  17 +-
+ .../accelerated-python/notebooks/applications/cosmic-web/90__cosmic_web__intro.ipynb     |  96 ++++++----
+ .../notebooks/applications/cosmic-web/91__cosmic_web__cupy__array_model.ipynb            |  12 +-
+ .../notebooks/applications/cosmic-web/92__cosmic_web__jax__fusion.ipynb                  |  10 +-
+ .../notebooks/applications/cosmic-web/93__cosmic_web__cccl__iterators.ipynb              |  16 +-
+ .../notebooks/applications/cosmic-web/94__cosmic_web__cppjit__cuda_kernel.ipynb          |  52 ++---
+ .../accelerated-python/notebooks/applications/cosmic-web/95__cosmic_web__synthesis.ipynb |  14 +-
+ tutorials/accelerated-python/notebooks/applications/cosmic-web/cosmic_core/__init__.py   |  16 +-
+ tutorials/accelerated-python/notebooks/applications/cosmic-web/cosmic_core/bench.py      | 181 +++++++-----------
+ tutorials/accelerated-python/notebooks/applications/cosmic-web/cosmic_core/config.py     |   5 +-
+ tutorials/accelerated-python/notebooks/applications/cosmic-web/cosmic_core/device.py     |  10 +-
+ tutorials/accelerated-python/notebooks/applications/cosmic-web/cosmic_core/ecc.py        |  28 ++-
+ .../notebooks/applications/cosmic-web/cosmic_core/{testfield.py => fields.py}            | 163 ++++++++++++----
+ tutorials/accelerated-python/notebooks/applications/cosmic-web/cosmic_core/kernels.py    |  35 ----
+ tutorials/accelerated-python/notebooks/applications/cosmic-web/cosmic_core/plots.py      |  28 +--
+ tutorials/accelerated-python/notebooks/applications/cosmic-web/cosmic_core/profile.py    |  29 ++-
+ tutorials/accelerated-python/notebooks/applications/cosmic-web/cosmic_core/quijote.py    |  85 +++++++++
+ tutorials/accelerated-python/notebooks/applications/cosmic-web/cosmic_core/sizing.py     |  30 +--
+ .../notebooks/applications/cosmic-web/cosmic_core/{dataset.py => zeldovich.py}           | 109 ++---------
+ .../notebooks/applications/cosmic-web/{cosmic_cub_histogram.cu => cub_histogram.cu}      |   0
+ .../notebooks/applications/cosmic-web/{cosmic_ecc.cu => ecc_histogram.cu}                |   5 +-
+ .../notebooks/applications/cosmic-web/{cosmic_ecc_variants.cu => ecc_histogram_rows.cu}  |   4 +-
+ .../applications/cosmic-web/solutions/91__cosmic_web__cupy__array_model__SOLUTION.ipynb  | 382 ------------------------------------
+ .../applications/cosmic-web/solutions/92__cosmic_web__jax__fusion__SOLUTION.ipynb        | 446 -------------------------------------------
+ .../applications/cosmic-web/solutions/93__cosmic_web__cccl__iterators__SOLUTION.ipynb    | 403 --------------------------------------
+ .../cosmic-web/solutions/94__cosmic_web__cppjit__cuda_kernel__SOLUTION.ipynb             | 431 -----------------------------------------
+ tutorials/accelerated-python/notebooks/applications/cosmic-web/solutions/cosmic_core     |   1 -
+ .../notebooks/applications/cosmic-web/solutions/cosmic_cub_histogram.cu                  |   1 -
+ tutorials/accelerated-python/notebooks/applications/cosmic-web/solutions/cosmic_ecc.cu   |   1 -
+ .../notebooks/applications/cosmic-web/solutions/cosmic_ecc_variants.cu                   |   1 -
+ tutorials/accelerated-python/notebooks/syllabi/sc26__8_hours.ipynb                       |  12 +-
+ tutorials/accelerated-python/test/test_cosmic_web_notebooks.py                           |  14 +-
+ 37 files changed, 519 insertions(+), 2184 deletions(-)
