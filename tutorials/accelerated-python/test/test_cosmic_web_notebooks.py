@@ -1,9 +1,8 @@
 """Test that the ordered cosmic-web sequence executes.
 
 Applications 90 through 94 write per-stage timing files and application 95
-reads them. Every notebook executes from the application directory so exercise
-and solution variants use the same helpers and generated state. Pytest runs
-parametrized cases in list order.
+reads them. Every notebook executes from the application directory, where the
+helpers and the generated state live. Pytest runs parametrized cases in list order.
 """
 
 import subprocess
@@ -20,11 +19,8 @@ NOTEBOOKS_DIR = Path(__file__).resolve().parent.parent / "notebooks"
 APPLICATION_DIR = NOTEBOOKS_DIR / "applications" / "cosmic-web"
 
 
-def _runnable_notebook(stem):
-    """Pick the solution variant if it exists, else the exercise notebook."""
-    sol = APPLICATION_DIR / "solutions" / f"{stem}__SOLUTION.ipynb"
-    if sol.exists():
-        return sol
+def _notebook(stem):
+    """The notebook of one stem in the application directory."""
     matches = sorted(APPLICATION_DIR.glob(f"{stem}*.ipynb"))
     return matches[0] if matches else None
 
@@ -37,7 +33,7 @@ COSMIC_WEB_STEMS = [
     "94__cosmic_web__cppjit__cuda_kernel",
     "95__cosmic_web__synthesis",
 ]
-sequence = [(stem, _runnable_notebook(stem)) for stem in COSMIC_WEB_STEMS]
+sequence = [(stem, _notebook(stem)) for stem in COSMIC_WEB_STEMS]
 missing = [stem for stem, notebook in sequence if notebook is None]
 if missing:
     raise FileNotFoundError(f"Missing expected tutorial notebooks: {', '.join(missing)}")

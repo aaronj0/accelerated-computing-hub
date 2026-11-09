@@ -4,8 +4,8 @@
 import numpy as np
 
 from .config import DEMO_BOX_MPC
-from .testfield import bin_edges, quantise
-from .dataset import zeldovich_displacement, cic_deposit, smooth_k, standardise
+from .fields import bin_edges, quantise, cic_density_device, blur_device, standardise_device
+from .zeldovich import zeldovich_positions
 from .ecc import ecc_cells_cupy, ecc_from_hist, euler_2d, zero_crossings
 from .bench import load_stage, bytes_model
 
@@ -46,24 +46,26 @@ def animate_particles(frames, n, frame_ms=500):
 def plot_points_to_field(n=128, growth=1.0, r_voxels=1.5):
     """Four panels on the middle plane at D = growth: particles near the plane, mass per cell, contrast blurred over
     r_voxels, ν."""
+    import cupy as cp
     import matplotlib.pyplot as plt
-    psi = zeldovich_displacement(n, DEMO_BOX_MPC)
+    pos = zeldovich_positions(n, growth, DEMO_BOX_MPC)
     z = n // 2
-    grid = np.indices((n, n, n), dtype=np.float64)
-    pos = [grid[a] + growth * psi[a] for a in range(3)]
-    rho = cic_deposit(pos, n)
-    delta_s, sigma0_sq, sigma1_sq = smooth_k(rho - 1.0, r_voxels)
-    nu, _ = standardise(delta_s, sigma0_sq, sigma1_sq)
-    near = np.abs(np.mod(pos[2] - z + n / 2, n) - n / 2) < 0.5
+    rho = cic_density_device(pos, n, box=n)
+    delta_s, sigma0_sq, sigma1_sq = blur_device(rho - np.float32(1.0), r_voxels)
+    nu, _ = standardise_device(delta_s.copy(), sigma0_sq, sigma1_sq)   # the copy keeps the contrast for panel 3
+
+    def plane(a):
+        return cp.asnumpy(a[:, :, z])
+    near = np.abs(np.mod(pos[:, 2] - z + n / 2, n) - n / 2) < 0.5
     fig, axes = plt.subplots(1, 4, figsize=(15.5, 4.2))
-    axes[0].scatter(np.mod(pos[0][near], n), np.mod(pos[1][near], n), s=0.3, c="#123", lw=0)
+    axes[0].scatter(np.mod(pos[near, 0], n), np.mod(pos[near, 1], n), s=0.3, c="#123", lw=0)
     axes[0].set_xlim(0, n)
     axes[0].set_ylim(0, n)
     axes[0].set_aspect("equal")
     axes[0].set_title("1. particles within half a cell of the plane")
-    panels = [(rho[:, :, z], "2. mass per cell", 0, 4),
-              (delta_s[:, :, z], f"3. contrast, blurred over R = {r_voxels:g} cells", -1, 3),
-              (nu[:, :, z], "4. ν = contrast / standard deviation", -3, 3)]
+    panels = [(plane(rho), "2. mass per cell", 0, 4),
+              (plane(delta_s), f"3. contrast, blurred over R = {r_voxels:g} cells", -1, 3),
+              (plane(nu), "4. ν = contrast / standard deviation", -3, 3)]
     for ax, (plane, label, lo, hi) in zip(axes[1:], panels):
         ax.imshow(plane.T, origin="lower", cmap="magma", vmin=lo, vmax=hi, interpolation="nearest")
         ax.set_title(label)

@@ -2,7 +2,6 @@
 // Signed histogram of cell births on a binned periodic field, one thread per voxel: q holds the bin index of every
 // voxel (int32, n^3, C order with k fastest) and hist holds K_BINS counters, zeroed by the caller. Each thread adds
 // (-1)^dim at the birth bin of its eight cells into a shared histogram, which the block then flushes into hist.
-// The body between the markers is the reference. Notebook 94 splices its own.
 
 #include <cuda_runtime.h>
 
@@ -20,7 +19,7 @@ __global__ void ecc_hist_kernel(const int* __restrict__ q, int* __restrict__ his
     if (t < nn * n) {
         const int k = static_cast<int>(t % n), j = static_cast<int>((t / n) % n), i = static_cast<int>(t / nn);
         const int i1 = wrap1(i, n), j1 = wrap1(j, n), k1 = wrap1(k, n);
-        // BEGIN BODY
+        // The eight corners: q at (i, j, k) and its periodic neighbours at i1, j1, k1.
         const int v000 = q[i * nn + j * n + k],   v100 = q[i1 * nn + j * n + k];
         const int v010 = q[i * nn + j1 * n + k],  v110 = q[i1 * nn + j1 * n + k];
         const int v001 = q[i * nn + j * n + k1],  v101 = q[i1 * nn + j * n + k1];
@@ -30,6 +29,7 @@ __global__ void ecc_hist_kernel(const int* __restrict__ q, int* __restrict__ his
         const int fxz = min(ex, min(v001, v101));
         const int fyz = min(ey, min(v001, v011));
         const int c   = min(fxy, min(min(v001, v101), min(v011, v111)));
+        // Count each birth in shared memory: +1 for the vertex and the faces, -1 for the edges and the cube.
         atomicAdd(&sh[v000], 1);
         atomicSub(&sh[ex], 1);
         atomicSub(&sh[ey], 1);
@@ -38,7 +38,6 @@ __global__ void ecc_hist_kernel(const int* __restrict__ q, int* __restrict__ his
         atomicAdd(&sh[fxz], 1);
         atomicAdd(&sh[fyz], 1);
         atomicSub(&sh[c], 1);
-        // END BODY
     }
     __syncthreads();
     for (int b = threadIdx.x; b < K_BINS; b += blockDim.x)

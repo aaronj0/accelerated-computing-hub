@@ -20,14 +20,10 @@ def device_properties():
             "sms": int(p["multiProcessorCount"]), "threads_per_sm": int(p["maxThreadsPerMultiProcessor"])}
 
 
-def free_bytes():
-    """(host, device) memory free at this moment, in bytes."""
+def free_device_bytes():
+    """Device memory free at this moment, in bytes."""
     import cupy
-    with open("/proc/meminfo") as f:
-        host = next((int(line.split()[1]) * 1024 for line in f if line.startswith("MemAvailable:")), None)
-    if host is None:
-        raise RuntimeError("no MemAvailable line in /proc/meminfo: cannot read the free host memory")
-    return host, int(cupy.cuda.runtime.memGetInfo()[0])
+    return int(cupy.cuda.runtime.memGetInfo()[0])
 
 
 def measure_copy_bandwidth_gbs():

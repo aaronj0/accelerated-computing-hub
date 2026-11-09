@@ -80,7 +80,6 @@ tutorials/accelerated-python/notebooks/applications/cosmic-web/timings
 tutorials/accelerated-python/notebooks/applications/cosmic-web/machine.json
 tutorials/accelerated-python/notebooks/applications/cosmic-web/data
 tutorials/accelerated-python/notebooks/applications/cosmic-web/*.py
-tutorials/accelerated-python/notebooks/applications/cosmic-web/solutions/*.py
 
 # Newton runtime outputs, model caches and learner backups are not image content.
 tutorials/newton/**/.generated

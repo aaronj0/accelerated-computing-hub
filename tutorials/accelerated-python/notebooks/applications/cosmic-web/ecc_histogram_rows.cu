@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-// The stencil and the shared histogram of cosmic_ecc.cu on a 3D grid (gridDim.x, n, n): blockIdx.y and
+// The stencil and the shared histogram of ecc_histogram.cu on a 3D grid (gridDim.x, n, n): blockIdx.y and
 // blockIdx.z carry j and i, so no thread divides to find its voxel, and each thread strides along k.
-// The names shared with cosmic_ecc.cu end in V: both files are compiled into the one interpreter, where a name is
+// The names shared with ecc_histogram.cu end in V: both files are compiled into the one interpreter, where a name is
 // defined once.
 
 #include <cuda_runtime.h>

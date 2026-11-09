@@ -9,10 +9,9 @@ import time
 
 import numpy as np
 
-from .config import (K_BINS, WARMUP, REPEATS, SWEEP_BUDGET_S, TIMINGS_DIR, STAGE_NOTEBOOK, RUN_INTRO_FIRST,
-                     HELD_MEMORY_HINT)
-from .device import free_bytes, release_pool
-from .testfield import field, cache_path
+from .config import K_BINS, WARMUP, REPEATS, TIMINGS_DIR, STAGE_NOTEBOOK, RUN_INTRO_FIRST, HELD_MEMORY_HINT
+from .device import free_device_bytes, release_pool
+from .fields import field, field_cache_path
 from .ecc import gate
 from .sizing import DEVICE_BYTES_PER_VOXEL, sweep_sizes, load_machine, copy_gbs
 
@@ -20,9 +19,7 @@ from .sizing import DEVICE_BYTES_PER_VOXEL, sweep_sizes, load_machine, copy_gbs
 # --- Timing -----------------------------------------------------------------------
 
 def timed_run(fn, *args):
-    """{median_s, min_s, max_s, repeats, samples_s} of fn(*args) after WARMUP calls.
-
-    `fn` must synchronise before it returns."""
+    """The times of REPEATS calls of fn(*args) after WARMUP calls, in seconds. `fn` must synchronise before it returns."""
     for _ in range(WARMUP):
         fn(*args)
     ts = []
@@ -31,8 +28,7 @@ def timed_run(fn, *args):
         fn(*args)
         ts.append(time.perf_counter() - t0)
     release_pool()   # the pool holds the call's temporaries; every stage starts from the same free memory
-    return {"median_s": float(np.median(ts)), "min_s": float(np.min(ts)), "max_s": float(np.max(ts)),
-            "repeats": REPEATS, "samples_s": [float(t) for t in ts]}
+    return ts
 
 
 def _gvoxel_s(n, seconds):
@@ -40,32 +36,36 @@ def _gvoxel_s(n, seconds):
     return n ** 3 / seconds / 1e9
 
 
-def measure(stage, run, n, *args, record=True, prepare=None, compile_s=0.0, note="", quiet=False):
-    """Check the first call of run(n, *args) against the reference at size n, time it and the median of repeated calls,
-    return the record.
-
-    A failed check raises before any timing. `prepare(n)` runs before the timer, `compile_s` is added to the first call, `note` says what
-    the first call includes, and with `record` the record is written to the stage file timings/<stage>.json."""
+def _run(stage, fn, n, args=(), prepare=None):
+    """(hist, first_s, samples_s, max_abs_diff) of fn(n, *args) at size n: the field built, `prepare(n)` run, the first
+    call timed and checked against the reference, then the repeated calls timed. A failed check raises before any timing."""
     field(n)
     if prepare is not None:
         prepare(n)
     t0 = time.perf_counter()
-    hist = np.asarray(run(n, *args))
-    cold_s = compile_s + time.perf_counter() - t0
+    hist = np.asarray(fn(n, *args))
+    first_s = time.perf_counter() - t0
     max_abs_diff, hist_sum = gate(n, hist)
     if max_abs_diff != 0 or hist_sum != 0:
         raise RuntimeError(f"[{stage}] N={n}^3 K={K_BINS}: max|Δχ| {max_abs_diff}, Σ {hist_sum}: the histogram does not "
                            "match the reference")
-    timing = timed_run(run, n, *args)
-    suffix = f" ({note})" if note else ""
-    line = (f"[{stage}] N={n}^3 K={K_BINS} | first call {cold_s * 1e3:.1f} ms{suffix}"
-            f" | median {timing['median_s'] * 1e3:.1f} ms = {_gvoxel_s(n, timing['median_s']):.3f} Gvoxel/s"
-            f" | max|Δχ| {max_abs_diff}"
-            f" | PASS")
+    return hist, first_s, timed_run(fn, n, *args), max_abs_diff
+
+
+def measure(stage, run, n, *args, record=True, prepare=None, compile_s=0.0, note="", quiet=False):
+    """Check the first call of run(n, *args) against the reference at size n, time it and the median of repeated calls,
+    return the record.
+
+    A failed check raises before any timing. `prepare(n)` runs before the timer, `compile_s` is added to the first call,
+    `note` says what the first call includes, and with `record` the record is written to timings/<stage>.json."""
+    hist, first_s, samples_s, max_abs_diff = _run(stage, run, n, args, prepare)
+    cold_s, median_s = compile_s + first_s, float(np.median(samples_s))
     if not quiet:
-        print(line)
-    result = {"stage": stage, "n": n, "k": K_BINS, **timing, "cold_s": cold_s, "max_abs_diff": max_abs_diff,
-              "hist_sum": hist_sum, "hist": hist.tolist()}
+        suffix = f" ({note})" if note else ""
+        print(f"[{stage}] N={n}^3 K={K_BINS} | first call {cold_s * 1e3:.1f} ms{suffix}"
+              f" | median {median_s * 1e3:.1f} ms = {_gvoxel_s(n, median_s):.3f} Gvoxel/s | max|Δχ| {max_abs_diff} | PASS")
+    result = {"stage": stage, "n": n, "k": K_BINS, "median_s": median_s, "samples_s": samples_s, "cold_s": cold_s,
+              "max_abs_diff": max_abs_diff, "hist": hist.tolist()}
     if compile_s:
         result["compile_s"] = compile_s
     if record:
@@ -74,52 +74,32 @@ def measure(stage, run, n, *args, record=True, prepare=None, compile_s=0.0, note
     return result
 
 
-def timed_sweep(fn, sizes, bytes_per_voxel, first_call=False, prepare=None):
-    """[{n, median_s, ...}] per sweep size, each checked against the reference before it is timed. Stops early and
-    names the skipped sizes.
+def timed_sweep(stage, fn, sizes, first_call=False, prepare=None):
+    """[{n, median_s, max_abs_diff[, first_s]}] per sweep size, each checked against the reference before it is timed.
 
-    The sweep stops at a size that would overrun SWEEP_BUDGET_S, or whose `bytes_per_voxel` (or the generator's, for a
-    size not yet cached) the free device memory does not hold. With `first_call`, `prepare(n)` runs first and the first call is timed as `first_s`."""
-    out, dropped, spent, reason = [], [], 0.0, ""
-    sizes = list(sizes)
+    The sweep stops at the first size whose budget, the stage's or the generator's for a size not yet cached, exceeds the
+    free device memory, and names the skipped sizes. With `first_call`, `prepare(n)` runs first and the first call is
+    timed as `first_s`."""
+    rows = []
     for i, n in enumerate(sizes):
-        if out:
-            last = out[-1]
-            per_run = last["median_s"] * (n / last["n"]) ** 3
-            if spent + per_run * (WARMUP + REPEATS) > SWEEP_BUDGET_S:
-                dropped, reason = sizes[i:], f"would overrun the {SWEEP_BUDGET_S:.0f} s budget"
-                break
-        # an uncached size is generated on the device first, at the generator's budget
-        generate = 0 if cache_path("field", n, ".npz").exists() else DEVICE_BYTES_PER_VOXEL["generate"]
-        need = max(bytes_per_voxel, generate) * n ** 3
-        free = free_bytes()[1]
+        generate = 0 if field_cache_path("field", n, ".npz").exists() else DEVICE_BYTES_PER_VOXEL["generate"]
+        need = max(DEVICE_BYTES_PER_VOXEL[stage], generate) * n ** 3
+        free = free_device_bytes()
         if need > free:
-            dropped = sizes[i:]
-            reason = (f"needs {need / 2 ** 30:.1f} GiB of device memory and {free / 2 ** 30:.1f} GiB is free; "
-                      f"{HELD_MEMORY_HINT}")
+            skipped = ", ".join(f"{m}^3" for m in sizes[i:])
+            print(f"  sweep stopped before N = {n}^3: it needs {need / 2 ** 30:.1f} GiB of device memory and "
+                  f"{free / 2 ** 30:.1f} GiB is free; {HELD_MEMORY_HINT}; skipped {skipped}")
             break
-        field(n)
-        if prepare is not None:
-            prepare(n)
-        t0 = time.perf_counter()
-        hist = fn(n)
-        row = {"n": n}
+        _, first_s, samples_s, max_abs_diff = _run(stage, fn, n, prepare=prepare)
+        row = {"n": n, "median_s": float(np.median(samples_s)), "max_abs_diff": max_abs_diff}
         if first_call:
-            row["first_s"] = time.perf_counter() - t0
-        row["max_abs_diff"], row["hist_sum"] = gate(n, hist)
-        if row["max_abs_diff"] != 0 or row["hist_sum"] != 0:
-            raise RuntimeError(f"exact check failed at N={n}^3: {row}")
-        r = timed_run(fn, n)
-        spent += time.perf_counter() - t0
-        row.update({"median_s": r["median_s"], "min_s": r["min_s"], "max_s": r["max_s"]})
-        print(f"  N={n:>4}^3  " + (f"first call {row['first_s'] * 1e3:9.2f} ms  " if first_call else "")
-              + f"median {r['median_s'] * 1e3:9.2f} ms  {_gvoxel_s(n, r['median_s']):7.3f} Gvoxel/s"
+            row["first_s"] = first_s
+        print(f"  N={n:>4}^3  " + (f"first call {first_s * 1e3:9.2f} ms  " if first_call else "")
+              + f"median {row['median_s'] * 1e3:9.2f} ms  {_gvoxel_s(n, row['median_s']):7.3f} Gvoxel/s"
               f"  max|Δχ| {row['max_abs_diff']}")
-        out.append(row)
+        rows.append(row)
         release_pool()
-    if dropped:
-        print(f"  sweep stopped before N = {dropped[0]}^3: it {reason}; skipped {', '.join(f'{m}^3' for m in dropped)}")
-    return out
+    return rows
 
 
 def by_size(build):
@@ -163,7 +143,7 @@ def save_sweep(stage, run, first_call=False, prepare=None):
 
     With `first_call`, the first call at every size is timed too, after `prepare(n)`."""
     sizes = sweep_sizes(stage)
-    rows = timed_sweep(run, sizes, DEVICE_BYTES_PER_VOXEL[stage], first_call, prepare)
+    rows = timed_sweep(stage, run, sizes, first_call, prepare)
     skipped = [int(m) for m in load_machine()["sweep"] if int(m) not in sizes]
     if skipped:
         per_voxel = DEVICE_BYTES_PER_VOXEL[stage]
@@ -192,7 +172,7 @@ def load_stages(stages, extras=()):
     """The records of `stages` and `extras` for the synthesis, after its checks.
 
     Stops when machine.json or the `cupy` record is missing, or the records are at different sizes. A missing stage
-    is named with its notebook and a missing extra is skipped; a record without its sweep or trace is named too."""
+    is named with its notebook, and so is a stage without its sweep or trace; a missing extra is skipped."""
     machine = load_machine()
     if not machine.get("device_name"):
         raise RuntimeError(f"no machine.json: {RUN_INTRO_FIRST}")
@@ -203,11 +183,11 @@ def load_stages(stages, extras=()):
     for s in stages:
         if s not in by_stage:
             print(f"stage {s!r} not recorded: run {STAGE_NOTEBOOK.get(s, s)} to add it")
-    present = {s: by_stage[s] for s in (*stages, *extras) if s in by_stage}
-    for s, r in present.items():
-        missing = [k for k in ("sweep", "trace") if k not in r]
+            continue
+        missing = [k for k in ("sweep", "trace") if k not in by_stage[s]]
         if missing:
             print(f"stage {s!r} has no {' or '.join(missing)}: rerun {STAGE_NOTEBOOK.get(s, s)} top to bottom")
+    present = {s: by_stage[s] for s in (*stages, *extras) if s in by_stage}
     sizes = {r["n"] for r in present.values()}
     if len(sizes) != 1:
         raise RuntimeError(f"stages were recorded at different sizes {sorted(sizes)}: rerun them on this machine")
@@ -219,15 +199,8 @@ def stage_table(by_stage, labels):
     """Print one line per stage: size, bins, the median, the first call and the exact check."""
     print(f"\n{'tool':<15} {'N':>5} {'K':>4} {'median ms':>9} {'first call ms':>13} {'max|Δχ|':>8}")
     for s, r in by_stage.items():
-        first = f"{r['cold_s'] * 1e3:13.1f}" if "cold_s" in r else f"{'-':>13}"
-        print(f"{labels[s]:<15} {r['n']:>4}^3 {r['k']:>4} {r['median_s'] * 1e3:9.2f} {first} "
-              f"{r.get('max_abs_diff', '?'):>8}")
-
-
-def describe_call(stage, launches):
-    """One line for a traced call: its stage, size, kernels, memcpys and memsets."""
-    return (f"[{stage}] one call at N = {launches['n']}^3: kernels {launches['kernels']}, "
-            f"memcpys {launches['memcpy']}, memsets {launches['memset']}")
+        print(f"{labels[s]:<15} {r['n']:>4}^3 {r['k']:>4} {r['median_s'] * 1e3:9.2f} {r['cold_s'] * 1e3:13.1f} "
+              f"{r['max_abs_diff']:>8}")
 
 
 def call_table(calls):
@@ -264,41 +237,35 @@ def wall_breakdown(record):
 
 def sweep_series(by_stage, labels):
     """Print the recorded sweeps as a table of Gvoxel/s per size and tool."""
-    rate = {s: ([p["n"] for p in by_stage[s]["sweep"]],
-                [_gvoxel_s(p["n"], p["median_s"]) for p in by_stage[s]["sweep"]])
-            for s in labels}
-    sizes = sorted({n for xs, _ in rate.values() for n in xs})
+    rate = {s: {p["n"]: _gvoxel_s(p["n"], p["median_s"]) for p in by_stage[s]["sweep"]} for s in labels}
+    sizes = sorted({n for r in rate.values() for n in r})
     print(f'{"N":>7}' + "".join(f"{labels[s]:>16}" for s in labels) + "   Gvoxel/s")
     for n in sizes:
-        cells = [f"{ys[xs.index(n)]:>16.3f}" if n in xs else f'{"-":>16}' for xs, ys in rate.values()]
-        print(f"{n:>4}^3 " + "".join(cells))
+        print(f"{n:>4}^3 " + "".join(f"{r[n]:>16.3f}" if n in r else f'{"-":>16}' for r in rate.values()))
 
 
 # --- Bytes models -----------------------------------------------------------------
 
-def bytes_breakdown(stage, n):
-    """[(operation, count, bytes)] of the DRAM traffic the stage's implementation issues at size n.
+# (operation, count, float32 passes over the field) of the DRAM traffic each implementation issues. A minimum over two
+# views of one array reads it from DRAM once: the shifted view's lines are served by L1 and L2 (confirmed with Nsight
+# Compute). bincount reads its input three times (the sign check, the maximum, the count), and the sign check writes and
+# reads a bool temporary: 0.5 of a pass. The kernels' block flushes are reductions at L2, so their model is the one read.
+BYTES_MODEL = {
+    "cupy":         [("roll (read + write)", 7, 2), ("minimum (two reads + write)", 7, 3),
+                     ("bincount (sign check, maximum, count)", 8, 3.5)],
+    "cupy_views":   [("minimum over views (read + write; the shifted view hits in cache)", 7, 2),
+                     ("bincount (sign check, maximum, count)", 8, 3.5)],
+    "jax":          [("scatter operand (lower bound: one read of the field each)", 8, 1)],
+    "cccl":         [("histogram pass (one read of the field each)", 8, 1)],
+    "numba":        [("field (one read)", 1, 1)],
+    "cppjit_cuda":  [("field (one read)", 1, 1)],
+}
+BYTES_MODEL["jax_bincount"] = BYTES_MODEL["jax"]
 
-    The kernels' block flushes are reductions at L2, so their model is the one read of the field. A minimum over two
-    views of one array reads it from DRAM once: the shifted view's lines are served by L1 and L2 (confirmed with
-    Nsight Compute)."""
-    v = n ** 3 * 4
-    # bincount reads its input three times: the sign check, the maximum and the count. The sign check also writes and
-    # reads a bool temporary: 0.5 of a float32 pass.
-    if stage == "cupy":
-        return [("roll (read + write)", 7, 2 * v),
-                ("minimum (two reads + write)", 7, 3 * v),
-                ("bincount (sign check, maximum, count)", 8, 3.5 * v)]
-    if stage == "cupy_views":
-        return [("minimum over views (read + write; the shifted view hits in cache)", 7, 2 * v),
-                ("bincount (sign check, maximum, count)", 8, 3.5 * v)]
-    if stage in ("jax", "jax_bincount"):
-        return [("scatter operand (lower bound: one read of the field each)", 8, v)]
-    if stage == "cccl":
-        return [("histogram pass (one read of the field each)", 8, v)]
-    if stage in ("numba", "cppjit_cuda"):
-        return [("field (one read)", 1, v)]
-    raise ValueError(f"no bytes model for {stage!r}")
+
+def bytes_breakdown(stage, n):
+    """[(operation, count, bytes)] of the stage's DRAM traffic at size n."""
+    return [(op, count, passes * n ** 3 * 4) for op, count, passes in BYTES_MODEL[stage]]
 
 
 def bytes_model(stage, n):

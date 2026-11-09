@@ -9,12 +9,14 @@ import sys
 from pathlib import Path
 
 from .config import HELD_MEMORY_HINT
-from .bench import attach, describe_call
+from .bench import attach
 
 PROBE_TEMPLATE = '''\
 # Profiler probe for the stage {stage}: the notebook's functions, one warm call of the runner, then one call between
 # cudaProfilerStart and cudaProfilerStop.
 import sys, time
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # the notebook directory
 import numpy as np
 import cupy as cp
 import cosmic_core as cw
@@ -49,12 +51,15 @@ import jax
 import jax.numpy as jnp
 '''
 
+PROBE_DIR = Path("nsys-probes")      # the probe scripts
+REPORT_DIR = Path("nsys-reports")    # the Nsight Systems reports and their exports
+
 NSYS_PROFILE = ["nsys", "profile", "-c", "cudaProfilerApi", "--capture-range-end=stop", "--cuda-graph-trace=node",
                 "--force-overwrite", "true"]
 
 
 def write_probe(stage, run, functions=(), args=(), state=(), header="", memory=False):
-    """Write nsys_probe_<stage>.py, the stage's self-contained profiler script, and return its path.
+    """Write nsys-probes/nsys_probe_<stage>.py, the stage's self-contained profiler script, and return its path.
 
     The script runs `header`, the source of `functions` and `run`, then the `state` lines (a line of code, or a
     `by_size` getter, whose defining line is copied), and calls `run(n, *args)` once warm and once profiled. With
@@ -62,11 +67,12 @@ def write_probe(stage, run, functions=(), args=(), state=(), header="", memory=F
     impl = "\n\n".join(inspect.getsource(inspect.unwrap(f)) for f in (*functions, run))
     lines = [x if isinstance(x, str) else x.source for x in state]
     call = f"{run.__name__}({', '.join(['n', *map(repr, args)])})"
-    path = f"nsys_probe_{stage}.py"
+    PROBE_DIR.mkdir(exist_ok=True)
+    path = PROBE_DIR / f"nsys_probe_{stage}.py"
     script = PROBE_TEMPLATE.format(stage=stage, header=header, impl=impl, state="\n".join(lines), call=call,
                                    prelude=PRELUDE_MEMORY if memory else "")
-    Path(path).write_text(script)
-    return path
+    path.write_text(script)
+    return str(path)
 
 
 def run_probe(cmd):
@@ -115,16 +121,19 @@ def trace_call(stage, run, n, functions=(), args=(), state=(), header="", memory
 
     Returns {"n", "kernels", "memcpy", "memset", "wall_s", "gpu_busy_s", "rows"}. With `memory`, the call allocates its
     temporaries afresh and the report records every allocation. With `quiet` nothing is printed.
-    The report is launch_<stage>.nsys-rep."""
+    The report is nsys-reports/launch_<stage>.nsys-rep."""
     probe = write_probe(stage, run, functions, args, state, header, memory)
     options = NSYS_PROFILE + (["--cuda-memory-usage=true"] if memory else [])
-    wall_s = run_probe(options + ["-o", f"launch_{stage}", sys.executable, probe, str(n)])
-    rows = nsys_trace_rows(f"launch_{stage}.nsys-rep")
+    REPORT_DIR.mkdir(exist_ok=True)
+    report = REPORT_DIR / f"launch_{stage}"
+    wall_s = run_probe(options + ["-o", str(report), sys.executable, probe, str(n)])
+    rows = nsys_trace_rows(report.with_suffix(".nsys-rep"))
     kinds = [kind for *_, kind in rows]
     launches = {"n": n, "kernels": kinds.count("kernel"), "memcpy": kinds.count("memcpy"),
                 "memset": kinds.count("memset"), "wall_s": wall_s, "gpu_busy_s": sum(d for _, d, _, _ in rows)}
     if not quiet:
-        print(describe_call(stage, launches))
+        print(f"[{stage}] one call at N = {n}^3: kernels {launches['kernels']}, memcpys {launches['memcpy']}, "
+              f"memsets {launches['memset']}")
     attach(stage, launches=launches, trace=[list(r) for r in rows])
     return {**launches, "rows": rows}
 
@@ -178,7 +187,7 @@ def ncu_report(stage, n, title, run=None, functions=(), args=(), state=(), heade
     if run is not None:
         write_probe(stage, run, functions, args, state, header)
     print(title)
-    metrics = ncu_profile([sys.executable, f"nsys_probe_{stage}.py", str(n)])
+    metrics = ncu_profile([sys.executable, str(PROBE_DIR / f"nsys_probe_{stage}.py"), str(n)])
     for key, label in NCU_METRICS.items():
         if key in metrics:
             value, unit = metrics[key]

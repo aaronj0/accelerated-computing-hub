@@ -5,7 +5,7 @@ import numpy as np
 
 from .config import K_BINS
 from .device import release_pool
-from .testfield import field, cache_path
+from .fields import field, field_cache_path
 
 
 def ecc_cells_cupy(q):
@@ -39,9 +39,9 @@ def ecc_from_hist(hist):
 
 
 def chi_reference(n):
-    """The reference curve of the test field at size n, computed once and cached under data/."""
+    """The reference curve of `field(n)`, computed once and cached under data/."""
     import cupy as cp
-    path = cache_path("chi", n, ".npy")
+    path = field_cache_path("chi", n, ".npy")
     if path.exists():
         return np.load(path)
     chi = ecc_from_hist(cp.asnumpy(ecc_hist_cupy(field(n))))
@@ -77,17 +77,11 @@ ANALYTIC_TOL = 0.105
 
 
 def zero_crossings(edges, chi):
-    """ν where the curve changes sign: interpolated between edges, or the edge itself where the value is zero."""
-    chi = np.asarray(chi, dtype=np.float64)
-    edges = np.asarray(edges, dtype=np.float64)
-    sign = np.sign(chi)
-    nonzero = np.nonzero(sign)[0]
-    out = []
-    for a, b in zip(nonzero[:-1], nonzero[1:]):
-        if sign[a] * sign[b] >= 0:
-            continue
-        if b == a + 1:
-            out.append(float(edges[a] + (edges[b] - edges[a]) * chi[a] / (chi[a] - chi[b])))
-        else:
-            out.append(float(edges[a + 1:b].mean()))
-    return out
+    """ν where the curve changes sign: interpolated between two edges, or the middle of a run of zeros."""
+    chi, edges = np.asarray(chi, dtype=np.float64), np.asarray(edges, dtype=np.float64)
+    nz = np.flatnonzero(chi)
+    a, b = nz[:-1], nz[1:]
+    cross = np.sign(chi[a]) != np.sign(chi[b])
+    a, b = a[cross], b[cross]
+    between = edges[a] + (edges[b] - edges[a]) * chi[a] / (chi[a] - chi[b])
+    return np.where(b > a + 1, 0.5 * (edges[a + 1] + edges[b - 1]), between).tolist()
